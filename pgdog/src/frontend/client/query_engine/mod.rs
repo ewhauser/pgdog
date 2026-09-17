@@ -66,6 +66,7 @@ pub(crate) struct QueryEngine {
     pending_explain: Option<ExplainResponseState>,
     hooks: QueryEngineHooks,
     advisory_locks: AdvisoryLocks,
+    session_advisory_locks_dirty: bool,
     // The client requested we disable transaction mode temporarily.
     // They will remain pinned to their connection until they unpin manually
     // or disconnect.
@@ -96,6 +97,7 @@ impl QueryEngine {
             begin_stmt: None,
             router: Router::default(),
             advisory_locks: AdvisoryLocks::default(),
+            session_advisory_locks_dirty: false,
             manual_lock: false,
         })
     }

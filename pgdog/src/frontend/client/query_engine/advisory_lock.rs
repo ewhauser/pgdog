@@ -6,6 +6,7 @@ use crate::frontend::router::parser::statement::{AdvisoryLocks as ParserAdvisory
 #[derive(Default, Debug)]
 pub(crate) struct AdvisoryLocks {
     locks: FnvHashSet<i64>,
+    observed: bool,
 }
 
 impl AdvisoryLocks {
@@ -27,7 +28,15 @@ impl AdvisoryLocks {
     }
 
     pub(crate) fn locked(&self) -> bool {
-        !self.locks.is_empty()
+        self.observed || !self.locks.is_empty()
+    }
+
+    /// Reconcile parser bookkeeping with the locks PostgreSQL actually holds.
+    pub(crate) fn reconcile(&mut self, held: bool) {
+        self.observed = held;
+        if !held {
+            self.locks.clear();
+        }
     }
 
     #[cfg(test)]

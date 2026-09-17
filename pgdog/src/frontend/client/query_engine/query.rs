@@ -13,7 +13,7 @@ use crate::{
     util::safe_timeout,
 };
 
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use super::hooks::schema::schema_changed;
 use super::*;
@@ -229,8 +229,27 @@ impl QueryEngine {
             self.stats.idle(context.in_transaction());
             // N.B. Call this before self.cleanup_backend(), since `cleanup_backend()` resets
             // the router and the command state.
-            self.advisory_locks
-                .merge(self.router.command().route().advisory_locks());
+            let advisory_locks = self.router.command().route().advisory_locks();
+            if advisory_locks.affects_session() {
+                self.advisory_locks.merge(advisory_locks);
+                self.session_advisory_locks_dirty = true;
+            }
+
+            // At idle, transaction-scoped advisory locks have been released. Querying
+            // PostgreSQL now lets us distinguish a failed pg_try_advisory_lock from a
+            // successful session lock without guessing from result shape or format.
+            if state == TransactionState::Idle && self.session_advisory_locks_dirty {
+                match self.backend.session_advisory_lock_held().await {
+                    Ok(held) => {
+                        self.advisory_locks.reconcile(held);
+                        self.session_advisory_locks_dirty = false;
+                    }
+                    Err(err) => {
+                        // Parser state remains conservative on inspection failure.
+                        warn!("failed to inspect session advisory locks: {err}");
+                    }
+                }
+            }
 
             self.check_lock();
 

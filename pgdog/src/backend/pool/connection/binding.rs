@@ -8,7 +8,10 @@ use crate::{
             two_pc::{TwoPcTransaction, statement::phase_control},
         },
     },
-    net::{FrontendPid, ProtocolMessage, Query, parameter::Parameters},
+    net::{
+        DataRow, Format, FromBytes, FrontendPid, ProtocolMessage, Query, ToBytes,
+        parameter::Parameters,
+    },
     state::State,
 };
 
@@ -361,6 +364,39 @@ impl Binding {
         }
 
         Ok(result)
+    }
+
+    /// Check whether any connected backend holds a session advisory lock.
+    ///
+    /// This must only run while PostgreSQL is idle: transaction-scoped advisory
+    /// locks are then gone, so every remaining granted advisory lock is scoped
+    /// to the session.
+    pub(crate) async fn session_advisory_lock_held(&mut self) -> Result<bool, Error> {
+        let messages = self
+            .execute(
+                "SELECT EXISTS (\
+                    SELECT 1 FROM pg_catalog.pg_locks \
+                    WHERE locktype = 'advisory' \
+                      AND pid = pg_catalog.pg_backend_pid() \
+                      AND granted\
+                )",
+            )
+            .await?;
+
+        let mut saw_row = false;
+        for message in messages {
+            if message.code() == 'D' {
+                saw_row = true;
+                let row = DataRow::from_bytes(message.to_bytes())?;
+                if row.get::<bool>(0, Format::Text).unwrap_or(true) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // No row is unexpected. Keep the connection pinned rather than risk
+        // returning a backend that still owns session state.
+        Ok(!saw_row)
     }
 
     pub(crate) async fn two_pc_on_guards(

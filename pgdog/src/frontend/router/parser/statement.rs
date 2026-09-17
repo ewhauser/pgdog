@@ -201,6 +201,13 @@ impl AdvisoryLocks {
         self.locks.is_empty()
     }
 
+    /// True if this statement can change session-scoped advisory locks.
+    pub(crate) fn affects_session(&self) -> bool {
+        self.locks
+            .iter()
+            .any(|lock| lock.scope == LockScope::Session)
+    }
+
     /// True if any advisory lock (pg_advisory_lock, etc.) was taken.
     #[cfg(test)]
     pub(crate) fn has_lock(&self) -> bool {
