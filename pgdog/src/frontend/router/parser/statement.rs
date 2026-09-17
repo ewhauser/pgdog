@@ -10,36 +10,44 @@ use pg_raw_parse::walk::Recurse;
 use pg_raw_parse::{ConstValue, Node, list, nodes, walk};
 use std::ops::ControlFlow;
 
+/// Name of a built-in function call, accepting an explicit `pg_catalog` schema.
+fn builtin_function_name(func: &nodes::FuncCall) -> Option<&str> {
+    let mut name_parts = func.funcname().into_iter().filter_map(Node::as_str);
+
+    match (name_parts.next(), name_parts.next(), name_parts.next()) {
+        (Some(name), None, None) | (Some("pg_catalog"), Some(name), None) => Some(name),
+        _ => None,
+    }
+}
+
 fn advisory_locks_from_func_call(
     func: &nodes::FuncCall,
     bind: Option<StatementParameters<'_>>,
     values_columns: Option<&ValuesColumns<'_>>,
 ) -> Vec<AdvisoryLock> {
-    let mut name_parts = func.funcname().into_iter().filter_map(Node::as_str);
-
-    let name = match (name_parts.next(), name_parts.next(), name_parts.next()) {
-        (Some(name), None, None) | (Some("pg_catalog"), Some(name), None) => name,
-        _ => return Vec::new(),
+    let Some(name) = builtin_function_name(func) else {
+        return Vec::new();
     };
 
-    let (unlock, scope) = match name {
-        "pg_advisory_lock"
-        | "pg_advisory_lock_shared"
-        | "pg_try_advisory_lock"
-        | "pg_try_advisory_lock_shared" => (false, LockScope::Session),
-        "pg_advisory_xact_lock"
-        | "pg_advisory_xact_lock_shared"
-        | "pg_try_advisory_xact_lock"
-        | "pg_try_advisory_xact_lock_shared" => (false, LockScope::Transaction),
+    let (unlock, scope, try_lock) = match name {
+        "pg_advisory_lock" | "pg_advisory_lock_shared" => (false, LockScope::Session, false),
+        "pg_try_advisory_lock" | "pg_try_advisory_lock_shared" => (false, LockScope::Session, true),
+        "pg_advisory_xact_lock" | "pg_advisory_xact_lock_shared" => {
+            (false, LockScope::Transaction, false)
+        }
+        "pg_try_advisory_xact_lock" | "pg_try_advisory_xact_lock_shared" => {
+            (false, LockScope::Transaction, true)
+        }
         // Session-scoped unlocks. xact locks can't be released by name;
         // Postgres drops them automatically at COMMIT/ROLLBACK.
-        "pg_advisory_unlock" => (true, LockScope::Session),
+        "pg_advisory_unlock" => (true, LockScope::Session, false),
         "pg_advisory_unlock_all" => {
             return vec![AdvisoryLock {
                 id: None,
                 unlock: true,
                 unlock_all: true,
                 scope: LockScope::Session,
+                try_lock: false,
             }];
         }
         _ => return Vec::new(),
@@ -55,6 +63,7 @@ fn advisory_locks_from_func_call(
             unlock,
             unlock_all: false,
             scope,
+            try_lock,
         }];
     };
 
@@ -69,6 +78,7 @@ fn advisory_locks_from_func_call(
             unlock,
             unlock_all: false,
             scope,
+            try_lock,
         }];
     } else if let Some(first_id) = integer_arg(arg, bind)
         && let Some(second_arg) = second_arg
@@ -82,6 +92,7 @@ fn advisory_locks_from_func_call(
             unlock,
             unlock_all: false,
             scope,
+            try_lock,
         }];
     }
 
@@ -102,6 +113,7 @@ fn advisory_locks_from_func_call(
             unlock,
             unlock_all: false,
             scope,
+            try_lock,
         }];
     }
 
@@ -145,6 +157,7 @@ fn advisory_locks_from_func_call(
                 unlock,
                 unlock_all: false,
                 scope,
+                try_lock,
             }];
         }
     }
@@ -165,6 +178,7 @@ fn advisory_locks_from_func_call(
                 unlock,
                 unlock_all: false,
                 scope,
+                try_lock,
             })
             .collect();
     }
@@ -174,6 +188,7 @@ fn advisory_locks_from_func_call(
         unlock,
         unlock_all: false,
         scope,
+        try_lock,
     }]
 }
 
@@ -270,6 +285,8 @@ pub(crate) struct AdvisoryLock {
     pub(crate) unlock: bool,
     pub(crate) unlock_all: bool,
     pub(crate) scope: LockScope,
+    /// `pg_try_advisory_*`: the lock is only taken if the call returns true.
+    pub(crate) try_lock: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -296,6 +313,16 @@ impl AdvisoryLockId {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AdvisoryLocks {
     locks: HashSet<AdvisoryLock>,
+    /// Top-level `pg_try_advisory_lock*` result columns whose boolean result
+    /// decides whether the session lock was actually acquired.
+    try_lock_columns: Vec<TryLockColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TryLockColumn {
+    column: usize,
+    /// One lock per result row, or a single lock repeated for every row.
+    locks: Vec<AdvisoryLock>,
 }
 
 impl AdvisoryLocks {
@@ -305,6 +332,37 @@ impl AdvisoryLocks {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.locks.is_empty()
+    }
+
+    pub(crate) fn has_inspectable_try_locks(&self) -> bool {
+        !self.try_lock_columns.is_empty()
+    }
+
+    /// True if the lock's outcome can be read from a result column.
+    pub(crate) fn inspects_try_lock(&self, lock: &AdvisoryLock) -> bool {
+        self.try_lock_columns
+            .iter()
+            .flat_map(|column| &column.locks)
+            .any(|try_lock| try_lock == lock)
+    }
+
+    pub(crate) fn try_lock_ids(&self) -> impl Iterator<Item = AdvisoryLockId> + '_ {
+        self.try_lock_columns
+            .iter()
+            .flat_map(|column| &column.locks)
+            .filter_map(|lock| lock.id)
+    }
+
+    /// Try locks whose result is in the given row, with their column index.
+    pub(crate) fn try_locks(&self, row: usize) -> impl Iterator<Item = (usize, &AdvisoryLock)> {
+        self.try_lock_columns.iter().filter_map(move |column| {
+            let lock = if column.locks.len() == 1 {
+                column.locks.first()
+            } else {
+                column.locks.get(row)
+            }?;
+            Some((column.column, lock))
+        })
     }
 
     /// True if any advisory lock (pg_advisory_lock, etc.) was taken.
@@ -763,9 +821,42 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
 
     /// Extract pg_advisory_lock / pg_advisory_unlock calls with literal integer keys.
     pub(crate) fn extract_advisory_locks(&mut self) -> AdvisoryLocks {
+        let try_lock_columns = self.try_lock_columns();
         AdvisoryLocks {
             locks: self.walk().advisory_locks.clone(),
+            try_lock_columns,
         }
+    }
+
+    /// Session try-lock calls in the top-level target list, whose boolean
+    /// results tell us whether each lock was acquired.
+    fn try_lock_columns(&self) -> Vec<TryLockColumn> {
+        let Node::SelectStmt(stmt) = self.stmt else {
+            return Vec::new();
+        };
+        let values_columns = collect_values_columns(stmt);
+
+        stmt.target_list()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(column, target)| {
+                let mut value = target.val();
+                while let Node::TypeCast(cast) = value {
+                    value = cast.arg();
+                }
+                let Node::FuncCall(func) = value else {
+                    return None;
+                };
+                if !matches!(
+                    builtin_function_name(func)?,
+                    "pg_try_advisory_lock" | "pg_try_advisory_lock_shared"
+                ) {
+                    return None;
+                }
+                let locks = advisory_locks_from_func_call(func, self.bind, values_columns.as_ref());
+                (!locks.is_empty()).then_some(TryLockColumn { column, locks })
+            })
+            .collect()
     }
 
     // Are we running? Or walking? MAKE UP YOUR MIND DAMMIT
@@ -3106,9 +3197,21 @@ mod test {
                     Some(AdvisoryLockId::TwoParameters(a, b)) => Some((a as i64, Some(b))),
                     None => None,
                 };
-                (id, l.unlock)
+                (id, l.unlock, l.try_lock)
             });
             v
+        }
+
+        fn try_locks(query: &str, row: usize) -> Vec<(usize, AdvisoryLock)> {
+            let schema = ShardingSchema::default();
+            let raw = pg_raw_parse::parse(query).unwrap();
+            let stmt = raw.stmts().next().unwrap();
+            let mut parser = StatementParser::new(stmt, None, &schema);
+            parser
+                .extract_advisory_locks()
+                .try_locks(row)
+                .map(|(column, lock)| (column, *lock))
+                .collect()
         }
 
         fn session(id: Option<AdvisoryLockId>, unlock: bool) -> AdvisoryLock {
@@ -3117,6 +3220,17 @@ mod test {
                 unlock,
                 unlock_all: false,
                 scope: LockScope::Session,
+                try_lock: false,
+            }
+        }
+
+        fn session_try(id: Option<AdvisoryLockId>) -> AdvisoryLock {
+            AdvisoryLock {
+                id,
+                unlock: false,
+                unlock_all: false,
+                scope: LockScope::Session,
+                try_lock: true,
             }
         }
 
@@ -3126,6 +3240,17 @@ mod test {
                 unlock,
                 unlock_all: false,
                 scope: LockScope::Transaction,
+                try_lock: false,
+            }
+        }
+
+        fn xact_try(id: Option<AdvisoryLockId>) -> AdvisoryLock {
+            AdvisoryLock {
+                id,
+                unlock: false,
+                unlock_all: false,
+                scope: LockScope::Transaction,
+                try_lock: true,
             }
         }
 
@@ -3135,6 +3260,7 @@ mod test {
                 unlock: true,
                 unlock_all: true,
                 scope: LockScope::Session,
+                try_lock: false,
             }
         }
 
@@ -3228,14 +3354,17 @@ mod test {
 
         #[test]
         fn all_session_lock_variants() {
+            assert_eq!(
+                locks("SELECT pg_advisory_lock_shared(7)"),
+                vec![session(Some(AdvisoryLockId::OneParameter(7)), false)],
+            );
             for q in [
                 "SELECT pg_try_advisory_lock(7)",
-                "SELECT pg_advisory_lock_shared(7)",
                 "SELECT pg_try_advisory_lock_shared(7)",
             ] {
                 assert_eq!(
                     locks(q),
-                    vec![session(Some(AdvisoryLockId::OneParameter(7)), false)],
+                    vec![session_try(Some(AdvisoryLockId::OneParameter(7)))],
                     "{q}"
                 );
             }
@@ -3248,8 +3377,6 @@ mod test {
             for q in [
                 "SELECT pg_advisory_xact_lock(7)",
                 "SELECT pg_advisory_xact_lock_shared(7)",
-                "SELECT pg_try_advisory_xact_lock(7)",
-                "SELECT pg_try_advisory_xact_lock_shared(7)",
             ] {
                 assert_eq!(
                     locks(q),
@@ -3257,6 +3384,52 @@ mod test {
                     "{q}"
                 );
             }
+            for q in [
+                "SELECT pg_try_advisory_xact_lock(7)",
+                "SELECT pg_try_advisory_xact_lock_shared(7)",
+            ] {
+                assert_eq!(
+                    locks(q),
+                    vec![xact_try(Some(AdvisoryLockId::OneParameter(7)))],
+                    "{q}"
+                );
+            }
+        }
+
+        #[test]
+        fn blocking_and_try_lock_with_same_key_remain_distinct() {
+            assert_eq!(
+                locks("SELECT pg_advisory_lock(5), pg_try_advisory_lock(5)"),
+                vec![
+                    session(Some(AdvisoryLockId::OneParameter(5)), false),
+                    session_try(Some(AdvisoryLockId::OneParameter(5)))
+                ],
+            );
+        }
+
+        #[test]
+        fn try_lock_result_columns() {
+            let lock = session_try(Some(AdvisoryLockId::OneParameter(5)));
+            assert_eq!(
+                try_locks("SELECT false, pg_try_advisory_lock(5)::bool AS acquired", 0),
+                vec![(1, lock)],
+            );
+            assert_eq!(
+                try_locks("SELECT false, pg_catalog.pg_try_advisory_lock(5)", 0),
+                vec![(1, lock)],
+            );
+            assert_eq!(
+                try_locks(
+                    "SELECT pg_try_advisory_lock(value) FROM (VALUES (5), (6)) AS t(value)",
+                    1,
+                ),
+                vec![(0, session_try(Some(AdvisoryLockId::OneParameter(6))))],
+            );
+            // xact try locks don't outlive the transaction, so their results
+            // aren't inspected; nested calls can't be mapped to a column.
+            assert!(try_locks("SELECT pg_try_advisory_xact_lock(5)", 0).is_empty());
+            assert!(try_locks("SELECT NOT pg_try_advisory_lock(5)", 0).is_empty());
+            assert!(try_locks("SELECT other.pg_try_advisory_lock(5)", 0).is_empty());
         }
 
         #[test]
@@ -3274,7 +3447,7 @@ mod test {
         fn cast_and_cte() {
             assert_eq!(
                 locks("SELECT pg_try_advisory_lock(9)::bool"),
-                vec![session(Some(AdvisoryLockId::OneParameter(9)), false)],
+                vec![session_try(Some(AdvisoryLockId::OneParameter(9)))],
             );
             assert_eq!(
                 locks("WITH x AS (SELECT pg_advisory_lock(11)) SELECT * FROM x"),
