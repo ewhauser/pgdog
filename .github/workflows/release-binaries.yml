@@ -21,15 +21,17 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-24.04
             deb: true
           - target: aarch64-unknown-linux-gnu
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
             deb: true
           - target: aarch64-apple-darwin      # Apple Silicon
             runner: macos-26
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TAG }}
 
       # Mirrors docker/Dockerfile.base-builder: cmake + clang for aws-lc-sys,
       # libssl-dev for openssl-sys, mold is the linker pinned in .cargo/config.toml.
