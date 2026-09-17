@@ -9,7 +9,12 @@ pub(crate) struct AdvisoryLocks {
 }
 
 impl AdvisoryLocks {
-    pub(crate) fn merge(&mut self, locks: &ParserAdvisoryLocks) {
+    pub(crate) fn merge(
+        &mut self,
+        locks: &ParserAdvisoryLocks,
+        successful_try_locks: &FnvHashSet<i64>,
+        indeterminate_try_locks: &FnvHashSet<i64>,
+    ) {
         for lock in locks.iter() {
             if lock.unlock {
                 if let Some(id) = lock.id {
@@ -20,6 +25,9 @@ impl AdvisoryLocks {
                 }
             } else if let Some(id) = lock.id
                 && lock.scope == LockScope::Session
+                && (!locks.inspects_try_lock(lock)
+                    || successful_try_locks.contains(&id)
+                    || indeterminate_try_locks.contains(&id))
             {
                 self.locks.insert(id);
             }

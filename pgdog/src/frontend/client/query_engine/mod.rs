@@ -6,10 +6,10 @@ use crate::{
         client::query_engine::{hooks::QueryEngineHooks, route_query::ClusterCheck},
         router::{Route, parser::Shard},
     },
-    net::{ErrorResponse, Message, Parameters},
+    net::{ErrorResponse, Format, Message, Parameters},
     state::State,
 };
-
+use fnv::FnvHashSet;
 use tracing::debug;
 
 pub(crate) mod advisory_lock;
@@ -66,6 +66,10 @@ pub(crate) struct QueryEngine {
     pending_explain: Option<ExplainResponseState>,
     hooks: QueryEngineHooks,
     advisory_locks: AdvisoryLocks,
+    successful_try_advisory_locks: FnvHashSet<i64>,
+    indeterminate_try_advisory_locks: FnvHashSet<i64>,
+    advisory_lock_result_formats: Vec<Format>,
+    advisory_lock_result_row: usize,
     // The client requested we disable transaction mode temporarily.
     // They will remain pinned to their connection until they unpin manually
     // or disconnect.
@@ -96,6 +100,10 @@ impl QueryEngine {
             begin_stmt: None,
             router: Router::default(),
             advisory_locks: AdvisoryLocks::default(),
+            successful_try_advisory_locks: FnvHashSet::default(),
+            indeterminate_try_advisory_locks: FnvHashSet::default(),
+            advisory_lock_result_formats: Vec::new(),
+            advisory_lock_result_row: 0,
             manual_lock: false,
         })
     }

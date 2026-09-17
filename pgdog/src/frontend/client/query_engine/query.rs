@@ -6,7 +6,7 @@ use crate::{
         router::parser::{explain_trace::ExplainTrace, rewrite::statement::plan::RewriteResult},
     },
     net::{
-        DataRow, FromBytes, Message, Protocol, ProtocolMessage, Query, ReadyForQuery,
+        DataRow, Format, FromBytes, Message, Protocol, ProtocolMessage, Query, ReadyForQuery,
         RowDescription, ToBytes, TransactionState,
     },
     state::State,
@@ -58,9 +58,16 @@ impl QueryEngine {
         self.hooks.after_connected(context, &self.backend)?;
 
         // Set response format.
-        for msg in context.client_request.messages.iter() {
-            if let ProtocolMessage::Bind(bind) = msg {
-                self.backend.bind(bind)?
+        for message in context.client_request.messages.iter() {
+            match message {
+                ProtocolMessage::Bind(bind) => {
+                    self.backend.bind(bind)?;
+                    self.advisory_lock_result_formats.clear();
+                    self.advisory_lock_result_formats
+                        .extend(bind.result_formats());
+                }
+                ProtocolMessage::Query(_) => self.advisory_lock_result_formats.clear(),
+                _ => {}
             }
         }
 
@@ -150,10 +157,45 @@ impl QueryEngine {
         }
 
         if code == 'E' {
+            self.indeterminate_try_advisory_locks.extend(
+                self.router
+                    .command()
+                    .route()
+                    .advisory_locks()
+                    .try_lock_ids(),
+            );
             if let Some(state) = self.pending_explain.as_mut() {
                 state.annotated = true;
             }
             self.pending_explain = None;
+        }
+
+        if code == 'D' {
+            let advisory_locks = self.router.command().route().advisory_locks();
+            if advisory_locks.has_inspectable_try_locks() {
+                let row = DataRow::from_bytes(message.to_bytes())?;
+
+                for (column, lock) in advisory_locks.try_locks(self.advisory_lock_result_row) {
+                    let format = match self.advisory_lock_result_formats.as_slice() {
+                        [format] => *format,
+                        formats => formats.get(column).copied().unwrap_or(Format::Text),
+                    };
+                    if let Some(id) = lock.id {
+                        match row.get::<bool>(column, format) {
+                            Some(true) => {
+                                self.successful_try_advisory_locks.insert(id);
+                            }
+                            Some(false) => {}
+                            None => {
+                                // If PostgreSQL changes the result shape, keep the
+                                // optimistic pin rather than return a locked backend.
+                                self.indeterminate_try_advisory_locks.insert(id);
+                            }
+                        }
+                    }
+                }
+                self.advisory_lock_result_row += 1;
+            }
         }
 
         // Messages that we need to send to the client immediately.
@@ -229,8 +271,16 @@ impl QueryEngine {
             self.stats.idle(context.in_transaction());
             // N.B. Call this before self.cleanup_backend(), since `cleanup_backend()` resets
             // the router and the command state.
-            self.advisory_locks
-                .merge(self.router.command().route().advisory_locks());
+            let advisory_locks = self.router.command().route().advisory_locks();
+            self.advisory_locks.merge(
+                advisory_locks,
+                &self.successful_try_advisory_locks,
+                &self.indeterminate_try_advisory_locks,
+            );
+            self.successful_try_advisory_locks.clear();
+            self.indeterminate_try_advisory_locks.clear();
+            self.advisory_lock_result_formats.clear();
+            self.advisory_lock_result_row = 0;
 
             self.check_lock();
 
