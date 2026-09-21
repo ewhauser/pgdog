@@ -8,6 +8,7 @@ updates:
     exclude-paths:
       - "integration/**"
       - "**/tests/**"
+    open-pull-requests-limit: 0
   - package-ecosystem: bundler
     directory: /
     schedule:
@@ -15,6 +16,7 @@ updates:
     exclude-paths:
       - "integration/**"
       - "**/tests/**"
+    open-pull-requests-limit: 0
   - package-ecosystem: gomod
     directory: /
     schedule:
@@ -22,6 +24,7 @@ updates:
     exclude-paths:
       - "integration/**"
       - "**/tests/**"
+    open-pull-requests-limit: 0
   - package-ecosystem: npm
     directory: /
     schedule:
@@ -29,6 +32,7 @@ updates:
     exclude-paths:
       - "integration/**"
       - "**/tests/**"
+    open-pull-requests-limit: 0
   - package-ecosystem: cargo
     directory: /
     schedule:
@@ -36,3 +40,4 @@ updates:
     exclude-paths:
       - "integration/**"
       - "**/tests/**"
+    open-pull-requests-limit: 0
