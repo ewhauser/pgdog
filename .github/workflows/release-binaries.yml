@@ -40,9 +40,12 @@ jobs:
           sudo apt-get install -y \
             build-essential cmake clang pkg-config libssl-dev mold
 
+      # Pinned: PgDog only loads plugins built by the identical rustc, and
+      # Cadence's pgdog_kafka_query_log plugin is built with 1.96.1.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.96.1
           targets: ${{ matrix.target }}
 
       - name: Build
