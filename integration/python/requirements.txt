@@ -4,7 +4,7 @@ asyncio==3.4.3
 asyncpg==0.30.0
 black==25.1.0
 click==8.2.0
-Django==5.1.7
+Django==5.2.17
 greenlet
 iniconfig==2.1.0
 mypy_extensions==1.1.0
