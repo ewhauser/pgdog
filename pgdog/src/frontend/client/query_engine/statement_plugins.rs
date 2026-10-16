@@ -25,6 +25,7 @@ use tracing::{error, warn};
 
 use super::*;
 use crate::net::{Format, Parse, Protocol, ProtocolMessage};
+use crate::parameters::ParameterValue;
 use crate::plugin::{LoadedPlugin, has_capability, with_capability};
 
 /// A client's prepared statement, as the client prepared it.
@@ -104,18 +105,17 @@ struct Session {
 
 impl Session {
     fn new(context: &QueryEngineContext<'_>) -> Self {
-        let param = |name: &str| {
-            context
-                .params
-                .get(name)
-                .map(|value| value.to_string())
-                .unwrap_or_default()
+        // Display quotes values for use in SQL; plugins get them as-is.
+        let value = |value: &ParameterValue| match value.as_str() {
+            Some(value) => value.to_owned(),
+            None => value.to_string(),
         };
+        let param = |name: &str| context.params.get(name).map(value).unwrap_or_default();
         let user = param("user");
         let database = context
             .params
             .get("database")
-            .map(|value| value.to_string())
+            .map(value)
             .unwrap_or_else(|| user.clone());
 
         Self {

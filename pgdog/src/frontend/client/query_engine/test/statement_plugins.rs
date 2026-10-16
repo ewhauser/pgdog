@@ -48,6 +48,10 @@ async fn test_simple_query_blocked() {
     let error = client.read_until('Z').await.unwrap_err();
     assert_eq!(error.code, "42501");
     assert!(error.message.starts_with("blocked for"), "{error:?}");
+    assert!(
+        !error.message.contains('"'),
+        "plugins get identity values unquoted: {error:?}"
+    );
     expect_message!(client.read().await, ReadyForQuery);
     assert!(
         !client.backend_connected(),
