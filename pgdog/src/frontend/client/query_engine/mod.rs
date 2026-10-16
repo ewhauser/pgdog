@@ -36,6 +36,7 @@ pub(crate) mod route_query;
 pub(crate) mod set;
 pub(crate) mod split;
 pub(crate) mod start_transaction;
+mod statement_plugins;
 mod temp_table;
 #[cfg(test)]
 mod test;
@@ -50,6 +51,7 @@ pub(crate) use context::QueryEngineContext;
 use notify_buffer::NotifyBuffer;
 pub(crate) use result::QueryEngineResult;
 pub(crate) use split::Pipeline;
+use statement_plugins::StatementPlugins;
 pub(in crate::frontend) use temp_table::TempTableChange;
 use temp_table::TempTables;
 use two_pc::TwoPc;
@@ -77,6 +79,7 @@ pub(crate) struct QueryEngine {
     temp_tables: TempTables,
     // Count how many rows we received from the query we are currently executing.
     result_row_counter: usize,
+    statement_plugins: StatementPlugins,
 }
 
 impl QueryEngine {
@@ -105,6 +108,7 @@ impl QueryEngine {
             manual_lock: false,
             temp_tables: Default::default(),
             result_row_counter: 0,
+            statement_plugins: StatementPlugins::default(),
         })
     }
 
@@ -150,6 +154,12 @@ impl QueryEngine {
         }
 
         log_query_stdout(context, client_request);
+
+        // Plugins see statements before anything else rewrites them.
+        if let Some(error) = self.apply_statement_plugins(context, client_request)? {
+            self.error_response(context, client_request, error).await?;
+            return Ok(QueryEngineResult::Done(context.transaction()));
+        }
 
         // Rewrite prepared statements.
         self.rewrite_extended(context, &mut client_request.messages)?;

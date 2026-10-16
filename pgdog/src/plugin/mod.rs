@@ -276,3 +276,6 @@ pub(crate) fn load_from_config() -> Result<(), Error> {
 
     load(&config.config)
 }
+
+#[cfg(test)]
+pub(crate) mod test;

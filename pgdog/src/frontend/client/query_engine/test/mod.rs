@@ -50,6 +50,7 @@ mod set_schema_sharding;
 mod sharded;
 mod sharded_prepared;
 mod spliced;
+mod statement_plugins;
 mod temp_table;
 mod test_omnisharded;
 mod transaction_state;
