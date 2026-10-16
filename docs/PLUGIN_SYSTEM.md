@@ -168,9 +168,9 @@ See [pgdog-plugin/src/statement.rs](../pgdog-plugin/src/statement.rs) and [pgdog
 
 ### Masks
 
-A rewrite can name result columns to mask with [`ColumnMask`](../pgdog-plugin/src/statement.rs): a column position, which result set it's in (only multi-statement queries have more than one), a plugin-defined `MaskId`, and whether the mask may block. Use masks for values that can't be computed in SQL, e.g. a keyed hash whose key must not appear in the statement, or tokens from a vault. The plugin needs the `MASK` capability.
+A rewrite can name result columns to mask with [`ColumnMask`](../pgdog-plugin/src/statement.rs): a column position, which result set it's in (only multi-statement queries have more than one), a plugin-defined `MaskId`, the column's type OID, and whether the mask may block. Use masks for values computed in code rather than SQL, e.g. a keyed hash whose key must not appear in the statement, tokens from a vault, or noise added to a number. The plugin needs the `MASK` capability.
 
-Masked columns must be `text`, `varchar` or `bpchar` (cast them in the rewrite if needed). For these types the text and binary formats are the same bytes, so masks never deal with formats. PgDog checks the column types when it sees the statement's `RowDescription`, and fails the statement otherwise.
+Masks keep the column's type: they get values of the declared type and return values of the same type. Values are in the format the client asked for, text for simple queries and what the client's `Bind` requested for the extended protocol; each `MaskColumn` carries its format, and masks return values in it. `pgdog_plugin::types` decodes and encodes common types in both formats. The type OID is the one Postgres reports in `RowDescription` (the base type, for domains; the catalog's `Column::type_oid`). PgDog checks it when it sees the statement's `RowDescription`, and fails the statement if it differs.
 
 PgDog collects a statement's `DataRow`s in batches and calls `mask_rows` once per batch, with the values of the masked columns only, column by column. The plugin writes one value per input value into `MaskOutput`, in the same order. A batch is the rows already received from the server, up to 256 rows or 1 MiB, so batching never makes the client wait for rows that haven't arrived. Rows are forwarded in order, after multi-shard results have been merged, sorted and aggregated. Batches with a blocking mask run on Tokio's blocking thread pool.
 
@@ -205,7 +205,7 @@ Plugins with `CATALOG` receive each database's [`Catalog`](../pgdog-plugin/src/c
 
 | Part | Contents |
 |---|---|
-| `COLUMNS` | Every column from `pg_attribute`, including those the role PgDog loads the schema with can't read, with type names, comments and security labels. |
+| `COLUMNS` | Every column from `pg_attribute`, including those the role PgDog loads the schema with can't read, with type names and OIDs, comments and security labels. |
 | `VIEWS` | Definitions and options of views and materialized views. |
 | `FUNCTIONS` | Functions and procedures outside `pg_catalog`, and the names of the functions in `pg_catalog`. |
 | `OPERATORS` | Operators outside `pg_catalog`. |

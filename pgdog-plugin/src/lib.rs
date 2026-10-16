@@ -198,6 +198,8 @@ pub use config::Config;
 pub use context::*;
 pub use mask::{MaskBatch, MaskColumn, MaskError, MaskOutput, Value};
 pub use parameters::*;
+/// Decode and encode Postgres values in text and binary formats, for masks.
+pub use pgdog_postgres_types as types;
 pub use pgdog_postgres_types::Format as ParameterFormat;
 pub use plugin::*;
 pub use redact::{ErrorField, ErrorFields, Redaction};

@@ -70,6 +70,9 @@ pub struct Column {
     /// `SECURITY LABEL ON COLUMN`, one per provider. Only loaded for plugins.
     #[serde(default)]
     pub security_labels: Vec<SecurityLabel>,
+    /// Type OID, the base type for domains. Only loaded for plugins.
+    #[serde(default)]
+    pub type_oid: u32,
 }
 
 /// A security label set with `SECURITY LABEL FOR <provider> ON ...`.

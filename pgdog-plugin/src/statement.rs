@@ -116,10 +116,12 @@ pub struct MaskId(pub u64);
 
 /// A result column PgDog passes to [`crate::Plugin::mask_rows`].
 ///
-/// The column must be `text`, `varchar` or `bpchar` in the rewritten statement
-/// (cast it if needed): for these types the text and binary formats are the
-/// same bytes, so masks never deal with formats. PgDog checks the type when it
-/// sees the statement's `RowDescription`, and fails the statement otherwise.
+/// `type_oid` is the column's type in the rewritten statement, as Postgres
+/// reports it in `RowDescription` (the base type, for domains). Masks receive
+/// values of that type and must return values of the same type, in the format
+/// the client asked for (see [`crate::MaskColumn::format`]). PgDog checks the
+/// type when it sees the statement's `RowDescription`, and fails the statement
+/// if it differs.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ColumnMask {
@@ -130,18 +132,21 @@ pub struct ColumnMask {
     pub column: u16,
     /// Mask to apply.
     pub mask: MaskId,
+    /// Type OID of the column.
+    pub type_oid: u32,
     /// The mask may block, e.g. on a network call. PgDog runs batches with a
     /// blocking mask on a thread pool for blocking work.
     pub blocking: bool,
 }
 
 impl ColumnMask {
-    /// Mask a column of the first result set.
-    pub fn new(column: u16, mask: MaskId) -> Self {
+    /// Mask a column of type `type_oid` in the first result set.
+    pub fn new(column: u16, mask: MaskId, type_oid: u32) -> Self {
         Self {
             result: 0,
             column,
             mask,
+            type_oid,
             blocking: false,
         }
     }
@@ -311,7 +316,7 @@ mod test {
     fn test_verdict_output() {
         let mut output = VerdictOutput::from(Verdict::Rewrite {
             sql: "SELECT 1".into(),
-            columns: vec![ColumnMask::new(2, MaskId(7)).blocking()],
+            columns: vec![ColumnMask::new(2, MaskId(7), 25).blocking()],
         });
         assert_eq!(output.action(), VERDICT_REWRITE);
         assert_eq!(output.sql().as_str(), Some("SELECT 1"));
@@ -321,6 +326,7 @@ mod test {
                 result: 0,
                 column: 2,
                 mask: MaskId(7),
+                type_oid: 25,
                 blocking: true,
             }]
         );

@@ -672,6 +672,8 @@ mod test {
         // data_type matches information_schema; type_name is format_type.
         assert_eq!(ssn.data_type, "character varying");
         assert_eq!(ssn.type_name, "character varying");
+        assert_eq!(ssn.type_oid, 1043);
+        assert_eq!(people.columns["id"].type_oid, 20);
         assert_eq!(people.columns["tags"].data_type, "ARRAY");
         assert_eq!(people.columns["tags"].type_name, "text[]");
         assert!(people.columns["id"].is_primary_key);

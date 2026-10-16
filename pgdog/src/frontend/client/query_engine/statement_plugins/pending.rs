@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tracing::debug;
 
-use super::masks::{Masking, Plan};
+use super::masks::{Masking, Plan, PortalPlan};
 
 /// A client message still waiting for its responses, with the mask plan of
 /// what it runs, if any.
@@ -20,8 +20,8 @@ pub(super) enum Pending {
     Parse,
     Bind,
     DescribeStatement(Option<Arc<Plan>>),
-    DescribePortal(Option<Arc<Plan>>),
-    Execute(Option<Arc<Plan>>),
+    DescribePortal(Option<PortalPlan>),
+    Execute(Option<PortalPlan>),
     Close,
     Sync,
 }
@@ -78,12 +78,17 @@ impl Pending {
             } => Some(Masking {
                 plan: plan.clone(),
                 result: *result,
+                formats: None,
             }),
-            Self::DescribeStatement(Some(plan))
-            | Self::DescribePortal(Some(plan))
-            | Self::Execute(Some(plan)) => Some(Masking {
+            Self::DescribeStatement(Some(plan)) => Some(Masking {
                 plan: plan.clone(),
                 result: 0,
+                formats: None,
+            }),
+            Self::DescribePortal(Some(portal)) | Self::Execute(Some(portal)) => Some(Masking {
+                plan: portal.plan.clone(),
+                result: 0,
+                formats: Some(portal.formats.clone()),
             }),
             _ => None,
         }

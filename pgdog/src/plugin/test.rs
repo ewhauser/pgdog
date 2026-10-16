@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use pgdog_plugin::{
     Capabilities, ColumnMask, Deny, ErrorFields, MaskBatch, MaskError, MaskId, MaskOutput, PdStr,
     Plugin, PluginVtable, Redaction, Session, Verdict,
+    types::{DataType, Datum},
 };
 
 use super::{LoadedPlugin, PLUGINS, Plugins};
@@ -20,8 +21,10 @@ pub(crate) const REWRITTEN: &str = "pgdog_test_rewritten";
 /// This is replaced with `pgdog_test_versioned_{VERSION}`. [`VERSION`] is also
 /// the plugin's generation.
 pub(crate) const VERSIONED: &str = "pgdog_test_version";
-/// The first column of these statements is uppercased by the plugin.
+/// The first column of these statements, text, is uppercased by the plugin.
 pub(crate) const MASK: &str = "pgdog_test_mask";
+/// The first column of these statements, an integer, is incremented by the plugin.
+pub(crate) const MASK_INT: &str = "pgdog_test_int_mask";
 /// Like [`MASK`], with a blocking mask.
 pub(crate) const MASK_BLOCKING: &str = "pgdog_test_slow_mask";
 /// The first column of the second result set is uppercased.
@@ -46,6 +49,10 @@ pub(crate) static MASK_BATCHES: AtomicU64 = AtomicU64::new(0);
 
 const UPPERCASE: MaskId = MaskId(1);
 const FAIL: MaskId = MaskId(2);
+const INCREMENT: MaskId = MaskId(3);
+
+const TEXT: u32 = 25;
+const INTEGER: u32 = 23;
 
 struct TestPlugin;
 
@@ -70,13 +77,15 @@ impl Plugin for TestPlugin {
                 &*session.user
             )))
         } else if sql.contains(MASK_FAIL) {
-            mask(ColumnMask::new(0, FAIL))
+            mask(ColumnMask::new(0, FAIL, TEXT))
         } else if sql.contains(MASK_BLOCKING) {
-            mask(ColumnMask::new(0, UPPERCASE).blocking())
+            mask(ColumnMask::new(0, UPPERCASE, TEXT).blocking())
         } else if sql.contains(MASK_SECOND) {
-            mask(ColumnMask::new(0, UPPERCASE).in_result(1))
+            mask(ColumnMask::new(0, UPPERCASE, TEXT).in_result(1))
+        } else if sql.contains(MASK_INT) {
+            mask(ColumnMask::new(0, INCREMENT, INTEGER))
         } else if sql.contains(MASK) {
-            mask(ColumnMask::new(0, UPPERCASE))
+            mask(ColumnMask::new(0, UPPERCASE, TEXT))
         } else if sql.contains(BAD_PARAMS) {
             Verdict::rewrite(format!("{sql}, $9::int"))
         } else if sql.contains(REWRITE) {
@@ -101,7 +110,22 @@ impl Plugin for TestPlugin {
                 return Err(MaskError::new("test mask failed"));
             }
             for value in column.values() {
-                out.push(value.map(|value| value.to_ascii_uppercase()).as_deref());
+                let masked = match value {
+                    None => None,
+                    Some(value) if column.mask == INCREMENT => {
+                        let datum = Datum::new(value, DataType::Integer, column.format, false)
+                            .map_err(|err| MaskError::new(err.to_string()))?;
+                        let Datum::Integer(n) = datum else {
+                            return Err(MaskError::new("not an integer"));
+                        };
+                        let encoded = Datum::Integer(n + 1)
+                            .encode(column.format)
+                            .map_err(|err| MaskError::new(err.to_string()))?;
+                        Some(encoded.to_vec())
+                    }
+                    Some(value) => Some(value.to_ascii_uppercase()),
+                };
+                out.push(masked.as_deref());
             }
         }
         Ok(())

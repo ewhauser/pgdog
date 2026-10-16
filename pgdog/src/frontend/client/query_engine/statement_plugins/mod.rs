@@ -40,7 +40,7 @@ mod masks;
 mod params;
 mod pending;
 
-use masks::{MAX_BATCH_BYTES, MAX_BATCH_ROWS, Masking, Plan};
+use masks::{MAX_BATCH_BYTES, MAX_BATCH_ROWS, Masking, Plan, PortalPlan};
 use params::max_parameter;
 use pending::{Pending, PendingQueue};
 
@@ -89,7 +89,7 @@ pub(super) struct StatementPlugins {
     /// Prepared statements by client statement name ("" is the unnamed statement).
     prepared: HashMap<String, Prepared>,
     /// Mask plans by portal name.
-    portals: HashMap<String, Option<Arc<Plan>>>,
+    portals: HashMap<String, Option<PortalPlan>>,
     /// Client messages waiting for responses, in order. Only kept when a
     /// plugin masks columns.
     pending: PendingQueue,
@@ -169,7 +169,7 @@ impl<'a> SessionStrings<'a> {
 #[derive(Debug, Default)]
 struct Staged {
     prepared: Vec<(String, Option<Prepared>)>,
-    portals: Vec<(String, Option<Option<Arc<Plan>>>)>,
+    portals: Vec<(String, Option<Option<PortalPlan>>)>,
     pending: Vec<Pending>,
 }
 
@@ -189,9 +189,9 @@ impl Staged {
     /// The mask plan of a portal, including portals bound earlier in this request.
     fn portal(
         &self,
-        portals: &HashMap<String, Option<Arc<Plan>>>,
+        portals: &HashMap<String, Option<PortalPlan>>,
         name: &str,
-    ) -> Option<Arc<Plan>> {
+    ) -> Option<PortalPlan> {
         match self.portals.iter().rev().find(|(staged, _)| staged == name) {
             Some((_, portal)) => portal.clone().flatten(),
             None => portals.get(name).cloned().flatten(),
@@ -427,6 +427,10 @@ impl QueryEngine {
                     }
                     // Otherwise not prepared through us: let Postgres report the error.
 
+                    let plan = plan.map(|plan| PortalPlan {
+                        plan,
+                        formats: bind.result_formats().collect(),
+                    });
                     staged.portals.push((portal, Some(plan)));
                     staged.pending.push(Pending::Bind);
                 }

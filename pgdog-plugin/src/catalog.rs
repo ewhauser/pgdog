@@ -123,6 +123,9 @@ pub struct Column {
     /// From `format_type`, without typmod, e.g. `public.mood` or `text[]`.
     /// Requires [`CatalogParts::COLUMNS`].
     pub type_name: String,
+    /// Type OID, as Postgres reports it in `RowDescription`: the base type for
+    /// domains. Requires [`CatalogParts::COLUMNS`].
+    pub type_oid: u32,
     pub is_primary_key: bool,
     /// `COMMENT ON COLUMN`. Requires [`CatalogParts::COLUMNS`].
     pub comment: Option<String>,

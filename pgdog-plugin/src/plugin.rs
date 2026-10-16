@@ -642,7 +642,7 @@ mod test {
                 "deny" => Verdict::Deny(Deny::insufficient_privilege("denied")),
                 "mask" => Verdict::Rewrite {
                     sql: "SELECT 1".into(),
-                    columns: vec![ColumnMask::new(1, MaskId(9))],
+                    columns: vec![ColumnMask::new(1, MaskId(9), 25)],
                 },
                 sql => Verdict::rewrite(format!("{sql} /* {} */", &*session.user)),
             }
@@ -694,7 +694,12 @@ mod test {
 
     fn mask(values: &[Option<&[u8]>]) -> Result<Vec<Option<Vec<u8>>>, HookError> {
         let values: Vec<_> = values.iter().map(|value| Value::new(*value)).collect();
-        let columns = [MaskColumn::new(0, MaskId(1), &values)];
+        let mask = ColumnMask::new(0, MaskId(1), 25);
+        let columns = [MaskColumn::new(
+            &mask,
+            crate::ParameterFormat::Text,
+            &values,
+        )];
         let batch = MaskBatch::new(values.len() as u32, &columns);
         let masked = VTABLE.mask_rows(&batch)?;
         Ok((0..masked.len())
@@ -727,7 +732,7 @@ mod test {
             VTABLE.statement(&session, "mask").unwrap(),
             Verdict::Rewrite {
                 sql: "SELECT 1".into(),
-                columns: vec![ColumnMask::new(1, MaskId(9))],
+                columns: vec![ColumnMask::new(1, MaskId(9), 25)],
             }
         );
         assert_eq!(

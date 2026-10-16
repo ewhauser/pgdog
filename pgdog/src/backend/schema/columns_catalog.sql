@@ -47,7 +47,9 @@ SELECT
         WHERE l.classoid = 'pg_catalog.pg_class'::pg_catalog.regclass
             AND l.objoid = c.oid
             AND l.objsubid = a.attnum
-    ), '[]')::text AS security_labels
+    ), '[]')::text AS security_labels,
+    -- RowDescription reports the base type of domains.
+    (CASE WHEN t.typtype = 'd' THEN t.typbasetype ELSE a.atttypid END)::bigint::text AS type_oid
 FROM
     pg_catalog.pg_class c
 JOIN

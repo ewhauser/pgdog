@@ -5,20 +5,13 @@ use std::sync::Arc;
 use bytes::{BufMut, Bytes, BytesMut};
 use pgdog_plugin::{ColumnMask, MaskBatch, MaskColumn, Value};
 
-use crate::net::{FromBytes, Message, RowDescription};
+use crate::net::{Format, FromBytes, Message, RowDescription};
 use crate::plugin::LoadedPlugin;
 
 /// Most rows masked in one call.
 pub(super) const MAX_BATCH_ROWS: usize = 256;
 /// Most bytes of rows masked in one call.
 pub(super) const MAX_BATCH_BYTES: usize = 1024 * 1024;
-
-/// Text types: their text and binary formats are the same bytes.
-const TEXT_TYPES: [i32; 3] = [
-    25,   // text
-    1043, // varchar
-    1042, // bpchar
-];
 
 /// Columns to mask, from a statement's verdict.
 #[derive(Debug)]
@@ -27,11 +20,21 @@ pub(super) struct Plan {
     pub(super) columns: Vec<ColumnMask>,
 }
 
+/// A portal's mask plan, with the result formats the client asked for in its `Bind`.
+#[derive(Debug, Clone)]
+pub(super) struct PortalPlan {
+    pub(super) plan: Arc<Plan>,
+    pub(super) formats: Arc<[Format]>,
+}
+
 /// The plan applying to a server message, and which result set it belongs to.
 #[derive(Debug, Clone)]
 pub(crate) struct Masking {
     pub(super) plan: Arc<Plan>,
     pub(super) result: u16,
+    /// Result formats from the portal's `Bind`; `None` for simple queries,
+    /// where every column is text.
+    pub(super) formats: Option<Arc<[Format]>>,
 }
 
 impl Masking {
@@ -49,7 +52,21 @@ impl Masking {
         self.columns().any(|column| column.blocking)
     }
 
-    /// Check that masked columns exist and are text. Returns why not.
+    /// Format of a result column. Follows the protocol: no codes means text, one
+    /// code applies to all columns, otherwise there is one per column.
+    fn format(&self, column: u16) -> Format {
+        match self.formats.as_deref() {
+            None | Some([]) => Format::Text,
+            Some([format]) => *format,
+            Some(formats) => formats
+                .get(column as usize)
+                .copied()
+                .unwrap_or(Format::Text),
+        }
+    }
+
+    /// Check that masked columns exist and have the types the plugin declared.
+    /// Returns why not.
     pub(super) fn check(&self, message: &Message) -> Result<(), String> {
         let description = RowDescription::from_bytes(message.payload())
             .map_err(|err| format!("invalid RowDescription: {err}"))?;
@@ -59,10 +76,10 @@ impl Masking {
                 .fields
                 .get(mask.column as usize)
                 .ok_or_else(|| format!("masked column {} doesn't exist", mask.column))?;
-            if !TEXT_TYPES.contains(&field.type_oid) {
+            if field.type_oid as u32 != mask.type_oid {
                 return Err(format!(
-                    "masked column \"{}\" isn't text (type OID {})",
-                    field.name, field.type_oid
+                    "masked column \"{}\" has type OID {}, the plugin expected {}",
+                    field.name, field.type_oid, mask.type_oid
                 ));
             }
         }
@@ -112,7 +129,7 @@ impl Masking {
         let columns: Vec<MaskColumn<'_>> = masks
             .iter()
             .zip(&values)
-            .map(|(mask, values)| MaskColumn::new(mask.column, mask.mask, values))
+            .map(|(mask, values)| MaskColumn::new(mask, self.format(mask.column), values))
             .collect();
         let batch = MaskBatch::new(rows.len() as u32, &columns);
         let output = self

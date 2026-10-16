@@ -14,6 +14,11 @@
 //! Use masks for values that can't be computed in SQL, e.g. a keyed hash whose
 //! key must not appear in the statement, or tokens from a vault.
 //!
+//! Values are in the format the client asked for: text for simple queries,
+//! and what the client's `Bind` requested for the extended protocol. Masks
+//! return values of the column's type in the same format. [`crate::types`]
+//! decodes and encodes common types in both formats.
+//!
 //! ### Example
 //!
 //! ```
@@ -35,14 +40,16 @@
 //!     fn statement(_session: &Session<'_>, sql: &str) -> Verdict {
 //!         Verdict::Rewrite {
 //!             sql: sql.to_owned(),
-//!             columns: vec![ColumnMask::new(0, MaskId(1))],
+//!             // A text column (type OID 25).
+//!             columns: vec![ColumnMask::new(0, MaskId(1), 25)],
 //!         }
 //!     }
 //!
 //!     fn mask_rows(batch: &MaskBatch<'_>, out: &mut MaskOutput) -> Result<(), MaskError> {
 //!         for column in batch.columns() {
 //!             for value in column.values() {
-//!                 // Keep NULLs, hide everything else.
+//!                 // Keep NULLs, hide everything else. Text is the same bytes
+//!                 // in both formats.
 //!                 out.push(value.map(|_| b"***".as_slice()));
 //!             }
 //!         }
@@ -53,6 +60,7 @@
 use std::{marker::PhantomData, ptr, slice};
 
 use crate::{MaskId, PdBuf, PdSlice, PdVec};
+use pgdog_postgres_types::Format;
 
 /// A column value, borrowed from PgDog's `DataRow` for the duration of
 /// [`crate::Plugin::mask_rows`].
@@ -101,15 +109,21 @@ pub struct MaskColumn<'a> {
     pub column: u16,
     /// Mask to apply, from the statement's [`crate::ColumnMask`].
     pub mask: MaskId,
+    /// Type OID of the column, from the statement's [`crate::ColumnMask`].
+    pub type_oid: u32,
+    /// Format of the values, which masked values must use too.
+    pub format: Format,
     values: PdSlice<'a, Value<'a>>,
 }
 
 impl<'a> MaskColumn<'a> {
     /// Create a column of a batch.
-    pub fn new(column: u16, mask: MaskId, values: &'a [Value<'a>]) -> Self {
+    pub fn new(mask: &crate::ColumnMask, format: Format, values: &'a [Value<'a>]) -> Self {
         Self {
-            column,
-            mask,
+            column: mask.column,
+            mask: mask.mask,
+            type_oid: mask.type_oid,
+            format,
             values: PdSlice::from(values),
         }
     }

@@ -144,6 +144,10 @@ impl From<DataRow> for Column {
                     .get_text(11)
                     .and_then(|labels| serde_json::from_str::<Vec<SecurityLabel>>(&labels).ok())
                     .unwrap_or_default(),
+                type_oid: value
+                    .get_text(12)
+                    .and_then(|oid| oid.parse().ok())
+                    .unwrap_or_default(),
             },
         }
     }

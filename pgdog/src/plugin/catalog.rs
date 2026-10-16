@@ -56,6 +56,7 @@ fn column(column: &pgdog_stats::Column) -> Column {
         name: column.column_name.clone(),
         data_type: column.data_type.clone(),
         type_name: column.type_name.clone(),
+        type_oid: column.type_oid,
         is_primary_key: column.is_primary_key,
         comment: column.comment.clone(),
         security_labels: column

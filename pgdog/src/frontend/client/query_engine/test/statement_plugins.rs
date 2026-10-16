@@ -465,9 +465,10 @@ async fn test_mask_failure_closes_connection() {
     assert!(!client.backend_connected(), "server connection was closed");
 }
 
-/// Masked columns must be text: checked on the statement's RowDescription.
+/// Masked columns must have the type the plugin declared: checked on the
+/// statement's RowDescription.
 #[tokio::test]
-async fn test_masked_column_must_be_text() {
+async fn test_masked_column_type_checked() {
     let mut client = test_client().await;
     client
         .send(Parse::named("not_text", format!("SELECT 1 /* {MASK} */")))
@@ -476,8 +477,45 @@ async fn test_masked_column_must_be_text() {
     client.send(Sync).await;
     assert!(
         client.try_process().await.is_err(),
-        "masking an integer fails the session"
+        "an integer where the plugin declared text fails the session"
     );
+}
+
+/// Masks get values in the format the client asked for, and return them in it.
+#[tokio::test]
+async fn test_masked_in_client_format() {
+    use crate::net::Format as WireFormat;
+
+    let mut client = test_client().await;
+
+    // Simple protocol: text.
+    client
+        .send_simple(Query::new(format!("SELECT 41 /* {MASK_INT} */")))
+        .await;
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(values(&messages), ["42"]);
+
+    // Extended protocol, binary results.
+    client
+        .send(Parse::named(
+            "int_mask",
+            format!("SELECT 41 /* {MASK_INT} */"),
+        ))
+        .await;
+    client
+        .send(Bind::new_params_codes_results("int_mask", &[], &[], &[1]))
+        .await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    expect_message!(client.read().await, ParseComplete);
+    let messages = client.read_until('Z').await.unwrap();
+    let row = messages
+        .iter()
+        .find(|message| message.code() == 'D')
+        .unwrap();
+    let row = DataRow::try_from(row.clone()).unwrap();
+    assert_eq!(row.get::<i32>(0, WireFormat::Binary), Some(42));
 }
 
 /// A suspended portal keeps its masks when it's resumed.
