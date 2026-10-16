@@ -51,7 +51,7 @@ pub(crate) use context::QueryEngineContext;
 use notify_buffer::NotifyBuffer;
 pub(crate) use result::QueryEngineResult;
 pub(crate) use split::Pipeline;
-use statement_plugins::StatementPlugins;
+use statement_plugins::{AuthenticatedIdentity, StatementPlugins};
 pub(in crate::frontend) use temp_table::TempTableChange;
 use temp_table::TempTables;
 use two_pc::TwoPc;
@@ -93,6 +93,12 @@ impl QueryEngine {
         let database = params.get_default("database", user);
 
         let backend = Connection::new(user, database, admin)?;
+        // The engine is created right after authentication, before the client
+        // can change any parameters, so these are the credentials it logged in with.
+        let identity = AuthenticatedIdentity {
+            user: user.to_owned(),
+            database: database.to_owned(),
+        };
 
         Ok(Self {
             backend,
@@ -108,7 +114,7 @@ impl QueryEngine {
             manual_lock: false,
             temp_tables: Default::default(),
             result_row_counter: 0,
-            statement_plugins: StatementPlugins::default(),
+            statement_plugins: StatementPlugins::new(identity),
         })
     }
 
@@ -155,9 +161,15 @@ impl QueryEngine {
 
         log_query_stdout(context, client_request);
 
+        // A plugin blocked an earlier extended protocol message: discard until Sync.
+        if self.skip_until_sync(context, client_request).await? {
+            return Ok(QueryEngineResult::Done(context.transaction()));
+        }
+
         // Plugins see statements before anything else rewrites them.
         if let Some(error) = self.apply_statement_plugins(context, client_request)? {
-            self.error_response(context, client_request, error).await?;
+            self.statement_blocked(context, client_request, error)
+                .await?;
             return Ok(QueryEngineResult::Done(context.transaction()));
         }
 

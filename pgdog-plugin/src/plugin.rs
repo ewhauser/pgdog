@@ -95,6 +95,37 @@ impl fmt::Display for HookError {
 
 impl std::error::Error for HookError {}
 
+/// A PgDog plugin.
+///
+/// # Concurrency
+///
+/// PgDog serves clients on many threads, and calls hooks from all of them:
+///
+/// - `route`, `statement` and `transform` run concurrently for different clients.
+///   For one client they're called one at a time, in the order of the client's
+///   messages and the server's responses.
+/// - `schema` and `reload` can run at any time, concurrently with the other
+///   hooks.
+/// - `release_transform` runs on the thread of the client that owned the
+///   transform, or on the thread dropping its session.
+///
+/// Plugins must make their own state safe to share across threads. Hooks run
+/// on PgDog's async workers, so they must not block.
+///
+/// # Transform handles
+///
+/// Every handle `statement` returns with [`StatementOutput::with_transform`] is
+/// owned by what the statement output belongs to, and is released with
+/// `release_transform` exactly once, when that ends:
+///
+/// - a `Query` or fast-path call: at its `ReadyForQuery`, after any COPY data;
+/// - a `Parse`: when the prepared statement is closed, replaced, or destroyed by
+///   a simple query (the unnamed statement), or the client disconnects;
+/// - a `Bind`: when the portal is closed, replaced, or destroyed by a simple
+///   query (the unnamed portal), or the transaction ends, or the client disconnects.
+///
+/// Handles are only identifiers: a plugin may return the same value for
+/// several statements, and is then released once for each time it returned it.
 pub trait Plugin {
     /// The version of your plugin. You can simply return
     /// `env!("CARGO_PKG_VERSION").into()`
@@ -212,8 +243,9 @@ pub trait Plugin {
         output.free()
     }
 
-    /// The statement a transform was attached to is done. PgDog calls this exactly
-    /// once per transform handle.
+    /// The query, prepared statement or portal a transform was attached to is
+    /// done. PgDog calls this exactly once for each handle `statement` returned.
+    /// See [Transform handles](Plugin#transform-handles).
     fn release_transform(_handle: u64) {}
 
     #[doc(hidden)]
@@ -232,6 +264,18 @@ pub trait Plugin {
     /// names, comments and security labels, view definitions and options, and
     /// non-system functions and operators. Names in view definitions, function
     /// bodies and type names are schema-qualified.
+    ///
+    /// The JSON object has a `format_version` field, currently
+    /// [`crate::SCHEMA_SNAPSHOT_VERSION`]. It changes whenever the format changes
+    /// incompatibly; plugins should reject versions they don't know.
+    ///
+    /// A snapshot is sent each time a database's schema finishes loading: at
+    /// startup, after configuration reloads, and after DDL when
+    /// `reload_schema_on_ddl` is enabled. Epochs only increase, so a plugin can
+    /// ignore a snapshot older than one it has. If loading fails, PgDog retries
+    /// and sends nothing until it succeeds: plugins keep their previous snapshot,
+    /// and must decide for themselves what to do for a database they have no
+    /// snapshot for yet (a security plugin should fail closed).
     fn schema(_database: &str, _epoch: u64, _snapshot: &str) {}
 
     #[doc(hidden)]

@@ -240,7 +240,7 @@ pub(crate) fn schema_loaded(database: &str, schema: &Schema) {
         return;
     }
 
-    let snapshot = match serde_json::to_string(&**schema) {
+    let snapshot = match snapshot(schema) {
         Ok(snapshot) => snapshot,
         Err(err) => {
             error!("failed to serialize schema for plugins: {err}");
@@ -256,6 +256,21 @@ pub(crate) fn schema_loaded(database: &str, schema: &Schema) {
             database, plugin.name, epoch
         );
     }
+}
+
+/// A schema snapshot as sent to plugins: the schema, versioned.
+fn snapshot(schema: &pgdog_stats::Schema) -> Result<String, serde_json::Error> {
+    #[derive(serde::Serialize)]
+    struct Snapshot<'a> {
+        format_version: u32,
+        #[serde(flatten)]
+        schema: &'a pgdog_stats::Schema,
+    }
+
+    serde_json::to_string(&Snapshot {
+        format_version: pgdog_plugin::SCHEMA_SNAPSHOT_VERSION,
+        schema,
+    })
 }
 
 /// Ask plugins to reload their configuration.
@@ -279,3 +294,17 @@ pub(crate) fn load_from_config() -> Result<(), Error> {
 
 #[cfg(test)]
 pub(crate) mod test;
+
+#[cfg(test)]
+mod snapshot_test {
+    #[test]
+    fn test_snapshot_is_versioned() {
+        let snapshot = super::snapshot(&pgdog_stats::Schema::default()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(
+            value["format_version"],
+            pgdog_plugin::SCHEMA_SNAPSHOT_VERSION
+        );
+        assert!(value["inner"].is_object(), "{snapshot}");
+    }
+}

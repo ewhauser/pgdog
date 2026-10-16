@@ -22,6 +22,12 @@ pub(crate) const VERSIONED: &str = "pgdog_test_version";
 /// with a single text column [`TRANSFORMED`].
 pub(crate) const TRANSFORM: &str = "pgdog_test_transform";
 pub(crate) const TRANSFORMED: &str = "transformed";
+/// Blocked on Bind, allowed on Parse.
+pub(crate) const BLOCK_BIND: &str = "pgdog_test_deny_on_bind";
+/// Statements containing this get a transform that fails on RowDescription.
+pub(crate) const FAIL_DESCRIBE: &str = "pgdog_test_fail_describe";
+/// Statements containing this get a transform that fails on ErrorResponse.
+pub(crate) const FAIL_ERROR: &str = "pgdog_test_fail_error";
 /// Statements containing this get a transform that fails.
 pub(crate) const TRANSFORM_FAIL: &str = "pgdog_test_transform_fail";
 
@@ -46,6 +52,17 @@ impl Plugin for TestPlugin {
 
     fn statement(context: StatementContext<'_>) -> StatementOutput {
         let sql = &*context.sql;
+        if sql.contains(BLOCK_BIND) && context.kind == pgdog_plugin::StatementKind::Bind {
+            return StatementOutput::block("42501", "bind denied");
+        }
+        if sql.contains(FAIL_DESCRIBE) {
+            return StatementOutput::cont()
+                .with_transform(HANDLE_FAIL, MessageCodes::none().with('T'));
+        }
+        if sql.contains(FAIL_ERROR) {
+            return StatementOutput::cont()
+                .with_transform(HANDLE_FAIL, MessageCodes::none().with('E'));
+        }
         if sql.contains(BLOCK) {
             StatementOutput::block("42501", format!("blocked for {}", &*context.identity.user))
         } else if sql.contains(TRANSFORM_FAIL) {

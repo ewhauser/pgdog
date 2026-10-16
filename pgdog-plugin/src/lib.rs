@@ -205,4 +205,6 @@ pub use transform::{TransformAction, TransformContext, TransformOutput};
 pub use libloading;
 
 pub const RUSTC_VERSION: &str = env!("RUSTC_VERSION");
+/// Version of the schema snapshot format sent to [`Plugin::schema`].
+pub const SCHEMA_SNAPSHOT_VERSION: u32 = 1;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

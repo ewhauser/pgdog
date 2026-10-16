@@ -308,8 +308,14 @@ impl QueryEngine {
         }
 
         // Plugins see exactly what the client would, after our own bookkeeping
-        // above read the server's version of the message.
-        self.transform_server_message(context, &mut message).await?;
+        // above read the server's version of the message. Intermediate
+        // ReadyForQuery messages of internally split queries aren't sent.
+        let client_visible = !(code == 'Z'
+            && !context.pipeline.is_done()
+            && context.pipeline.is_simple()
+            && !context.in_error());
+        self.transform_server_message(context, &mut message, client_visible)
+            .await?;
 
         // Messages that we need to send to the client immediately.
         // ReadyForQuery (B) | CopyInResponse (B) | ErrorResponse(B) | NoticeResponse(B) | NotificationResponse (B)
