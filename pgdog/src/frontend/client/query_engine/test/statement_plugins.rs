@@ -228,3 +228,46 @@ async fn test_transform_failure_closes_connection() {
     assert_eq!(error.code, "XX000");
     assert!(!client.backend_connected(), "server connection was closed");
 }
+
+/// Admin database commands are PgDog's own and never reach Postgres, so
+/// statement plugins must not see them.
+#[tokio::test]
+async fn test_admin_commands_skip_statement_plugins() {
+    use crate::config::{config, load_test, set};
+    use crate::frontend::client::test::SpawnedClient;
+    use crate::net::{Authentication, Password};
+
+    load_test_plugin();
+    load_test();
+    let mut cfg = (*config()).clone();
+    cfg.config.general.auth_type = pgdog_config::AuthType::Plain;
+    cfg.config.admin.password = "admin".into();
+    set(cfg).unwrap();
+
+    let cfg = config();
+    let mut params = Parameters::default();
+    params.insert("user", cfg.config.admin.user.as_str());
+    params.insert("database", cfg.config.admin.name.as_str());
+    let mut client = SpawnedClient::new_with_login(params).await;
+    expect_message!(client.read().await, Authentication);
+    client.send(Password::new_password("admin")).await;
+    let ok = expect_message!(client.read().await, Authentication);
+    assert!(matches!(ok, Authentication::Ok));
+    client.read_until('Z').await;
+
+    // The test plugin blocks anything containing its marker.
+    client
+        .send(Query::new(format!("SHOW CLIENTS /* {BLOCK} */")))
+        .await;
+    let messages = client.read_until('Z').await;
+    for message in messages {
+        if message.code() == 'E' {
+            let error = ErrorResponse::try_from(message).unwrap();
+            assert!(
+                !error.message.starts_with("blocked for"),
+                "admin command went through the plugin: {error:?}"
+            );
+        }
+    }
+    client.join().await;
+}

@@ -242,7 +242,8 @@ impl QueryEngine {
     ) -> Result<Option<ErrorResponse>, Error> {
         self.statement_plugins.release_transforms();
 
-        if !has_capability(Capabilities::STATEMENT) {
+        // Admin database commands are handled by PgDog and never reach Postgres.
+        if context.admin || !has_capability(Capabilities::STATEMENT) {
             return Ok(None);
         }
 
