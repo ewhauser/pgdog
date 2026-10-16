@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::schema::SchemaCache;
 use crate::backend::server::ServerRequest;
+use crate::plugin;
 use crate::{
     backend::{
         Schema, ShardedTables, databases::User as DatabaseUser, replication::ShardedSchemas,
@@ -25,6 +26,7 @@ use crate::{
         parameter::ParameterValue,
     },
 };
+use pgdog_plugin::Capabilities;
 
 use super::{
     Address, CanonicalOids, ClusterFailoverSignalWatcher, ClusterMetrics, Config, Error, Guard,
@@ -662,8 +664,13 @@ impl Cluster {
     pub(super) fn load_schema(&self) -> bool {
         match self.load_schema {
             LoadSchema::On => true,
-            LoadSchema::Off => false,
-            LoadSchema::Auto => self.shards.len() > 1 || self.multi_tenant().is_some(),
+            // Plugins that need the schema can't work without it.
+            LoadSchema::Off => plugin::has_capability(Capabilities::SCHEMA),
+            LoadSchema::Auto => {
+                self.shards.len() > 1
+                    || self.multi_tenant().is_some()
+                    || plugin::has_capability(Capabilities::SCHEMA)
+            }
         }
     }
 

@@ -1,5 +1,5 @@
 use pgdog_plugin::{
-    Context as PdRouterContext, ReadWrite, Shard as PdShard,
+    Capabilities, Context as PdRouterContext, ReadWrite, Shard as PdShard,
     parameters::{Parameter, Parameters},
 };
 use std::string::String as StdString;
@@ -28,19 +28,13 @@ impl QueryParser {
         statement: &Ast,
         read: bool,
     ) -> Result<(), Error> {
-        let plugins = if let Some(plugins) = plugins() {
-            plugins
-        } else {
-            return Ok(());
-        };
-
-        if plugins.is_empty() {
+        if !has_capability(Capabilities::ROUTE) {
             return Ok(());
         }
 
-        // Run plugins, if any.
+        // Run plugins, in config order.
         // The first plugin to returns something, wins.
-        debug!("executing {} router plugins", plugins.len());
+        debug!("executing router plugins");
 
         let params_data;
         let params = if let Some(bind) = context.router_context.bind {
@@ -74,15 +68,16 @@ impl QueryParser {
             params,
         };
 
-        for (plugin_name, plugin) in plugins {
-            let route = plugin.route(context);
+        for plugin in with_capability(Capabilities::ROUTE) {
+            let plugin_name = plugin.name();
+            let route = plugin.vtable().route(context);
             match route.shard.try_into() {
                 Ok(shard) => match shard {
                     PdShard::All => self.plugin_output.shard = Some(Shard::All),
                     PdShard::Direct(shard) => self.plugin_output.shard = Some(Shard::Direct(shard)),
                     PdShard::Unknown => self.plugin_output.shard = None,
                     PdShard::Blocked => {
-                        return Err(Error::BlockedByPlugin(plugin_name.clone()));
+                        return Err(Error::BlockedByPlugin(plugin_name.to_owned()));
                     }
                 },
                 Err(_) => self.plugin_output.shard = None,
@@ -94,14 +89,14 @@ impl QueryParser {
                 _ => self.plugin_output.read = None,
             }
 
-            self.plugin_output.plugin_name = Some(plugin_name.clone());
+            self.plugin_output.plugin_name = Some(plugin_name.to_owned());
 
             if self.plugin_output.provided() {
                 let shard_override = self.plugin_output.shard.clone();
                 let read_override = self.plugin_output.read;
                 if let Some(recorder) = self.recorder_mut() {
                     recorder.record_plugin_override(
-                        plugin_name.clone(),
+                        plugin_name.to_owned(),
                         shard_override,
                         read_override,
                     );

@@ -26,6 +26,7 @@ use crate::frontend::PreparedStatements;
 use crate::frontend::client::query_engine::two_pc::Manager;
 use crate::frontend::router::parser::Cache;
 use crate::frontend::router::sharding::{Mapping, ShardedTable};
+use crate::plugin;
 use crate::{
     backend::pool::PoolConfig,
     config::{ConfigAndUsers, ShardedMappingDeprecated, config, load},
@@ -182,6 +183,9 @@ pub(crate) fn reload(force: bool) -> Result<(), Error> {
 
     // Resize query cache.
     Cache::resize(new_config.config.general.query_cache_limit);
+
+    // Plugins can't be added or removed at runtime, but they can reload their own config.
+    plugin::reload();
 
     Ok(())
 }

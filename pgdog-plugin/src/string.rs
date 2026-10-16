@@ -49,6 +49,12 @@ impl Deref for PdStr<'_> {
     }
 }
 
+impl std::fmt::Debug for PdStr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
 impl PartialEq for PdStr<'_> {
     fn eq(&self, other: &Self) -> bool {
         **self == **other

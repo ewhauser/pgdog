@@ -12,7 +12,7 @@ use crate::{
         sharding::{self, Centroids, ContextBuilder, ShardOrLookup},
     },
     net::{messages::Vector, parameter::ParameterValue},
-    plugin::plugins,
+    plugin::{has_capability, with_capability},
 };
 
 #[cfg(test)]

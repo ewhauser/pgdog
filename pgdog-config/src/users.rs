@@ -29,6 +29,12 @@ pub struct Plugin {
     /// Path to the configuration file for the plugin, if any. Plugin-specific settings can be
     /// placed there. It's completely plugin-specific and any fomrat is acceptable.
     pub config: Option<PathBuf>,
+
+    /// Refuse to start PgDog if this plugin fails to load, e.g., the shared library is missing,
+    /// it was built with a different compiler or plugin API version, or it rejected its configuration.
+    /// Use this for plugins that enforce security policies, so PgDog never serves traffic without them.
+    #[serde(default)]
+    pub required: bool,
 }
 
 /// This configuration controls which users are allowed to connect to PgDog. This is a TOML list so for each user, add a `[[users]]` section to `users.toml`.

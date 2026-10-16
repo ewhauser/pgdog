@@ -1,5 +1,6 @@
 use super::Cluster;
 use crate::backend::pool::ee::schema_changed_hook;
+use crate::plugin;
 use crate::tasks;
 use crate::util::safe_sleep;
 use dyn_clone::DynClone;
@@ -77,7 +78,12 @@ impl SchemaLoader for FromServer {
 
                     match result {
                         Ok(true) => {
-                            schema_changed_hook(&shard.schema(), &identifier, &shard);
+                            let schema = shard.schema();
+                            schema_changed_hook(&schema, &identifier, &shard);
+                            // Shard 0 is the canonical schema source, same as `Cluster::schema`.
+                            if shard.number() == 0 {
+                                plugin::schema_loaded(&identifier.database, &schema);
+                            }
                             return;
                         }
                         Ok(false) => return,

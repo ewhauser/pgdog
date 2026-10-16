@@ -175,6 +175,8 @@
 //! ```
 //!
 
+pub mod buffer;
+pub mod capabilities;
 mod config;
 pub mod context;
 pub mod logging;
@@ -182,14 +184,23 @@ pub mod macros;
 pub mod parameters;
 pub mod plugin;
 pub mod prelude;
+pub mod statement;
 pub mod string;
+pub mod transform;
 
+pub use buffer::{PdBuf, PdSlice};
+pub use capabilities::Capabilities;
 pub use config::Config;
 pub use context::*;
 pub use parameters::*;
 pub use pgdog_postgres_types::Format as ParameterFormat;
 pub use plugin::*;
+pub use statement::{
+    Identity, MessageCodes, StatementAction, StatementContext, StatementDecision, StatementKind,
+    StatementOutput, Transform,
+};
 pub use string::PdStr;
+pub use transform::{TransformAction, TransformContext, TransformOutput};
 
 pub use libloading;
 
