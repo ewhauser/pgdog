@@ -7,7 +7,7 @@ use std::{
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use super::{Error, columns::Column};
+use super::{CatalogDetail, Error, catalog, columns::Column};
 use crate::{
     backend::Server,
     net::messages::{DataRow, Format},
@@ -66,14 +66,19 @@ impl From<DataRow> for Relation {
                 parent_table_schema: non_empty(value.get_text(8)),
                 parent_table_name: non_empty(value.get_text(9)),
                 columns: IndexMap::new(),
+                definition: None,
+                options: Vec::new(),
             },
         }
     }
 }
 
 impl Relation {
-    /// Load relations and their columns.
-    pub(crate) async fn load(server: &mut Server) -> Result<Vec<Relation>, Error> {
+    /// Load relations and their columns, plus view definitions with the full catalog.
+    pub(crate) async fn load(
+        server: &mut Server,
+        detail: CatalogDetail,
+    ) -> Result<Vec<Relation>, Error> {
         let mut relations: HashMap<_, _> = server
             .fetch_all::<Relation>(TABLES)
             .await?
@@ -85,7 +90,7 @@ impl Relation {
                 )
             })
             .collect();
-        let columns = Column::load(server).await?;
+        let columns = Column::load(server, detail).await?;
         for column in columns {
             if let Some(relation) = relations.get_mut(&column.0) {
                 relation.columns = column
@@ -93,6 +98,15 @@ impl Relation {
                     .into_iter()
                     .map(|c| (c.column_name.clone(), c.into()))
                     .collect();
+            }
+        }
+
+        if detail == CatalogDetail::Full {
+            for view in catalog::views(server).await? {
+                if let Some(relation) = relations.get_mut(&(view.schema, view.name)) {
+                    relation.definition = view.definition;
+                    relation.options = view.options;
+                }
             }
         }
 
@@ -115,6 +129,8 @@ impl Relation {
             parent_table_schema: None,
             parent_table_name: None,
             columns: columns.into_iter().map(|(k, v)| (k, v.into())).collect(),
+            definition: None,
+            options: Vec::new(),
         }
         .into()
     }
@@ -130,6 +146,8 @@ mod test {
     async fn test_load_relations() {
         let pool = pool();
         let mut conn = pool.get(&Request::default()).await.unwrap();
-        let _relations = Relation::load(&mut conn).await.unwrap();
+        let _relations = Relation::load(&mut conn, CatalogDetail::Standard)
+            .await
+            .unwrap();
     }
 }

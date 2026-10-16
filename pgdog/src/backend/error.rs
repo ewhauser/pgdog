@@ -75,6 +75,9 @@ pub(crate) enum Error {
     #[error("protocol is out of sync")]
     ProtocolOutOfSync,
 
+    #[error("invalid catalog row: {0}")]
+    CatalogRow(#[from] serde_json::Error),
+
     #[error("rollback left server in inconsistent state")]
     RollbackFailed,
 

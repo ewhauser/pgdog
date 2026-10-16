@@ -4,14 +4,16 @@ pub(crate) use pgdog_stats::ForeignKey;
 pub(crate) use pgdog_stats::ForeignKeyAction;
 use serde::{Deserialize, Serialize};
 
-use super::Error;
+use super::{CatalogDetail, Error, catalog::fetch_qualified};
 use crate::{backend::Server, net::messages::DataRow};
+use pgdog_stats::SecurityLabel;
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
 };
 
 static COLUMNS: &str = include_str!("columns.sql");
+static COLUMNS_CATALOG: &str = include_str!("columns_catalog.sql");
 static FOREIGN_KEYS: &str = include_str!("foreign_keys.sql");
 
 /// Represents a row from the foreign_keys.sql query.
@@ -74,11 +76,18 @@ impl DerefMut for Column {
 
 impl Column {
     /// Load all columns from server, including foreign key information.
+    ///
+    /// The full catalog reads `pg_attribute`, which isn't filtered by privileges
+    /// like `information_schema` is, and adds type names, comments and security labels.
     pub(crate) async fn load(
         server: &mut Server,
+        detail: CatalogDetail,
     ) -> Result<HashMap<(String, String), Vec<Column>>, Error> {
         let mut result = HashMap::new();
-        let rows: Vec<Self> = server.fetch_all(COLUMNS).await?;
+        let rows: Vec<Self> = match detail {
+            CatalogDetail::Standard => server.fetch_all(COLUMNS).await?,
+            CatalogDetail::Full => fetch_qualified(server, COLUMNS_CATALOG).await?,
+        };
 
         for row in rows {
             let entry = result
@@ -125,6 +134,13 @@ impl From<DataRow> for Column {
                 ordinal_position: value.get::<i32>(7, Format::Text).unwrap_or(0),
                 is_primary_key: value.get_text(8).unwrap_or_default() == "true",
                 foreign_keys: Vec::new(),
+                // Only in the full catalog query.
+                type_name: value.get_text(9).unwrap_or_default(),
+                comment: value.get_text(10).filter(|comment| !comment.is_empty()),
+                security_labels: value
+                    .get_text(11)
+                    .and_then(|labels| serde_json::from_str::<Vec<SecurityLabel>>(&labels).ok())
+                    .unwrap_or_default(),
             },
         }
     }
@@ -135,6 +151,7 @@ mod test {
     use super::Error;
     use crate::backend::pool::Request;
     use crate::backend::pool::test::pool;
+    use crate::backend::schema::CatalogDetail;
     use crate::backend::schema::columns::Column;
 
     #[tokio::test]
@@ -159,7 +176,7 @@ mod test {
         )
         .await?;
 
-        let columns = Column::load(&mut conn).await?;
+        let columns = Column::load(&mut conn, CatalogDetail::Standard).await?;
         for table in ["parted", "parted_0", "parted_1"] {
             let table_columns = columns
                 .get(&("pk_partition_test".to_owned(), table.to_owned()))
@@ -183,7 +200,9 @@ mod test {
     async fn test_load_columns() {
         let pool = pool();
         let mut conn = pool.get(&Request::default()).await.unwrap();
-        let _columns = Column::load(&mut conn).await.unwrap();
+        let _columns = Column::load(&mut conn, CatalogDetail::Standard)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -221,7 +240,9 @@ mod test {
         .await
         .unwrap();
 
-        let columns = Column::load(&mut conn).await.unwrap();
+        let columns = Column::load(&mut conn, CatalogDetail::Standard)
+            .await
+            .unwrap();
 
         // Find the customer_id column in fk_test_orders (uses "pgdog" schema in test db)
         let orders_columns = columns
@@ -298,7 +319,9 @@ mod test {
         .await
         .unwrap();
 
-        let columns = Column::load(&mut conn).await.unwrap();
+        let columns = Column::load(&mut conn, CatalogDetail::Standard)
+            .await
+            .unwrap();
 
         let child_columns = columns
             .get(&("pgdog".to_string(), "fk_comp_child".to_string()))

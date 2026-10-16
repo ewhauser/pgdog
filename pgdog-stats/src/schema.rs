@@ -60,6 +60,23 @@ pub struct Column {
     pub ordinal_position: i32,
     pub is_primary_key: bool,
     pub foreign_keys: Vec<ForeignKey>,
+    /// Type name from `format_type`, without typmod and schema-qualified unless
+    /// it's in `pg_catalog`. Only loaded with the full catalog.
+    #[serde(default)]
+    pub type_name: String,
+    /// `COMMENT ON COLUMN`. Only loaded with the full catalog.
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// `SECURITY LABEL ON COLUMN`, one per provider. Only loaded with the full catalog.
+    #[serde(default)]
+    pub security_labels: Vec<SecurityLabel>,
+}
+
+/// A security label set with `SECURITY LABEL FOR <provider> ON ...`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SecurityLabel {
+    pub provider: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -78,6 +95,14 @@ pub struct Relation {
     pub parent_table_name: Option<String>,
     /// Columns indexed by name, ordered by ordinal position.
     pub columns: IndexMap<String, Column>,
+    /// Query of a view or materialized view, from `pg_get_viewdef`, with every
+    /// name schema-qualified. Only loaded with the full catalog.
+    #[serde(default)]
+    pub definition: Option<String>,
+    /// Storage and view options (`reloptions`), e.g. `security_barrier=true`.
+    /// Only loaded with the full catalog.
+    #[serde(default)]
+    pub options: Vec<String>,
 }
 
 impl Hash for Relation {
@@ -96,6 +121,8 @@ impl Hash for Relation {
             key.hash(state);
             value.hash(state);
         }
+        self.definition.hash(state);
+        self.options.hash(state);
     }
 }
 
@@ -137,6 +164,77 @@ impl Relation {
     pub fn has_column(&self, name: &str) -> bool {
         self.columns.contains_key(name)
     }
+
+    /// This is a view.
+    pub fn is_view(&self) -> bool {
+        self.type_ == "view"
+    }
+
+    /// This is a materialized view.
+    pub fn is_materialized_view(&self) -> bool {
+        self.type_ == "materialized view"
+    }
+}
+
+/// A function or procedure from `pg_proc`, outside `pg_catalog` and
+/// `information_schema`.
+///
+/// Type names come from `format_type`: without typmod, and schema-qualified
+/// unless they're in `pg_catalog`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct Function {
+    pub oid: i64,
+    pub schema: String,
+    pub name: String,
+    /// `function`, `procedure`, `aggregate` or `window`.
+    pub kind: String,
+    /// Input argument types, in order. Includes `VARIADIC` and arguments with defaults.
+    pub argument_types: Vec<String>,
+    /// Input argument names, in order; empty for unnamed arguments.
+    pub argument_names: Vec<String>,
+    /// Number of trailing input arguments that have defaults.
+    pub argument_defaults: i32,
+    /// The last input argument is `VARIADIC`.
+    pub variadic: bool,
+    pub return_type: String,
+    /// `RETURNS` clause from `pg_get_function_result`, e.g. `SETOF text` or `TABLE(id bigint)`.
+    pub result: String,
+    pub returns_set: bool,
+    /// Names of `OUT`, `INOUT` and `TABLE` columns, in order.
+    pub output_names: Vec<String>,
+    /// Types of `OUT`, `INOUT` and `TABLE` columns, in order.
+    pub output_types: Vec<String>,
+    /// `sql`, `plpgsql`, `c`, `internal`, ...
+    pub language: String,
+    /// `prosrc`: the body as written, or the link symbol for C functions.
+    pub source: String,
+    /// `BEGIN ATOMIC` / `RETURN` bodies from `pg_get_function_sqlbody`, with
+    /// every name schema-qualified. Postgres 14+.
+    pub sql_body: Option<String>,
+    /// `immutable`, `stable` or `volatile`.
+    pub volatility: String,
+    pub security_definer: bool,
+    pub strict: bool,
+    /// `SET` clauses (`proconfig`), e.g. `search_path=public`.
+    pub config: Vec<String>,
+    /// Extension that owns this function, if any.
+    pub extension: Option<String>,
+}
+
+/// An operator from `pg_operator`, outside `pg_catalog` and `information_schema`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct Operator {
+    pub oid: i64,
+    pub schema: String,
+    pub name: String,
+    /// Left operand type; `None` for prefix operators.
+    pub left_type: Option<String>,
+    pub right_type: Option<String>,
+    pub result_type: String,
+    /// Function implementing the operator.
+    pub function_oid: i64,
+    pub function_schema: String,
+    pub function_name: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -144,6 +242,21 @@ pub struct SchemaInner {
     pub search_path: Vec<String>,
     pub relations: Relations,
     pub aggregate_functions: HashSet<String>,
+    /// The full catalog was loaded: columns from `pg_attribute` (not filtered by
+    /// privileges), view definitions, comments, security labels, functions and
+    /// operators, and the names of system functions. Only done when a plugin
+    /// needs the schema.
+    #[serde(default)]
+    pub full_catalog: bool,
+    /// Non-system functions. Only loaded with the full catalog.
+    #[serde(default)]
+    pub functions: Vec<Function>,
+    /// Non-system operators. Only loaded with the full catalog.
+    #[serde(default)]
+    pub operators: Vec<Operator>,
+    /// Names of the functions in `pg_catalog`, sorted. Only loaded with the full catalog.
+    #[serde(default)]
+    pub system_functions: Vec<String>,
 }
 
 impl Hash for SchemaInner {
@@ -160,6 +273,10 @@ impl Hash for SchemaInner {
                 relation.hash(state);
             }
         }
+        self.full_catalog.hash(state);
+        self.functions.hash(state);
+        self.operators.hash(state);
+        self.system_functions.hash(state);
     }
 }
 

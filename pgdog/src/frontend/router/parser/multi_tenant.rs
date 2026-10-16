@@ -120,6 +120,7 @@ mod tests {
                 ordinal_position: 1,
                 is_primary_key: false,
                 foreign_keys: Vec::new(),
+                ..Default::default()
             }
             .into(),
         );

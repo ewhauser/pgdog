@@ -226,6 +226,12 @@ pub trait Plugin {
     ///
     /// Called when PgDog loads or reloads the schema. `epoch` increases with every
     /// snapshot PgDog takes, across all databases.
+    ///
+    /// The snapshot is `pgdog_stats::Schema` with the full catalog: columns from
+    /// `pg_attribute` (not filtered by the loading role's privileges), their type
+    /// names, comments and security labels, view definitions and options, and
+    /// non-system functions and operators. Names in view definitions, function
+    /// bodies and type names are schema-qualified.
     fn schema(_database: &str, _epoch: u64, _snapshot: &str) {}
 
     #[doc(hidden)]

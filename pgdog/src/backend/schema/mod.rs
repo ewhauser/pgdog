@@ -1,5 +1,6 @@
 //! Schema operations.
 pub(crate) mod cache;
+pub(crate) mod catalog;
 pub(crate) mod columns;
 pub(crate) mod relation;
 pub(crate) mod sync;
@@ -18,9 +19,32 @@ pub(crate) use relation::Relation;
 use super::{Cluster, Error, Server, pool::Request};
 use crate::frontend::router::parser::Table;
 use crate::net::parameter::ParameterValue;
+use crate::plugin;
+use pgdog_plugin::Capabilities;
 use sync::ShardConfig;
 
 static SETUP: &str = include_str!("setup.sql");
+
+/// How much of the catalog to load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogDetail {
+    /// What PgDog itself needs: relations and the columns the loading role can see.
+    Standard,
+    /// Everything plugins may need: columns from `pg_attribute`, view definitions,
+    /// comments, security labels, functions and operators.
+    Full,
+}
+
+impl CatalogDetail {
+    /// The full catalog is loaded only for plugins that receive schema snapshots.
+    pub(crate) fn current() -> Self {
+        if plugin::has_capability(Capabilities::SCHEMA) {
+            Self::Full
+        } else {
+            Self::Standard
+        }
+    }
+}
 
 /// Load schema from database.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Hash)]
@@ -45,8 +69,16 @@ impl DerefMut for Schema {
 impl Schema {
     /// Load schema from a server connection.
     pub(crate) async fn load(server: &mut Server) -> Result<Self, Error> {
+        Self::load_with(server, CatalogDetail::current()).await
+    }
+
+    /// Load schema from a server connection, with the given catalog detail.
+    pub(crate) async fn load_with(
+        server: &mut Server,
+        detail: CatalogDetail,
+    ) -> Result<Self, Error> {
         let mut relations: StatsRelations = HashMap::new();
-        for relation in Relation::load(server).await? {
+        for relation in Relation::load(server, detail).await? {
             relations
                 .entry(relation.schema().to_owned())
                 .or_default()
@@ -70,10 +102,23 @@ impl Schema {
             .into_iter()
             .collect();
 
+        let (functions, operators, system_functions) = match detail {
+            CatalogDetail::Standard => (Vec::new(), Vec::new(), Vec::new()),
+            CatalogDetail::Full => (
+                catalog::functions(server).await?,
+                catalog::operators(server).await?,
+                catalog::system_functions(server).await?,
+            ),
+        };
+
         let inner = SchemaInner {
             search_path,
             relations,
             aggregate_functions,
+            full_catalog: detail == CatalogDetail::Full,
+            functions,
+            operators,
+            system_functions,
         };
 
         Ok(Self {
@@ -112,6 +157,7 @@ impl Schema {
                 search_path,
                 relations: nested,
                 aggregate_functions: aggregate_functions.into_iter().collect(),
+                ..Default::default()
             }),
         }
     }
@@ -260,6 +306,7 @@ mod test {
 
     use super::super::pool::test::pool;
     use super::Schema;
+    use pgdog_stats::SecurityLabel;
 
     #[tokio::test]
     async fn test_schema() {
@@ -591,5 +638,190 @@ mod test {
                 .aggregate_functions
                 .contains(&String::from("pgdog_sum"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_load_full_catalog() {
+        use super::CatalogDetail;
+
+        let mut server = test_server().await;
+        server.execute_checked("BEGIN").await.unwrap();
+        server
+            .execute_checked(
+                "CREATE SCHEMA catalog_test;
+                 CREATE TABLE catalog_test.people (id BIGINT PRIMARY KEY, ssn VARCHAR(11), tags TEXT[]);
+                 COMMENT ON COLUMN catalog_test.people.ssn IS 'Social security number. pgdog:tag=pii.ssn';
+                 CREATE VIEW catalog_test.people_ssn WITH (security_barrier) AS SELECT id, ssn FROM catalog_test.people;
+                 CREATE MATERIALIZED VIEW catalog_test.people_count AS SELECT count(*) AS n FROM catalog_test.people;
+                 CREATE FUNCTION catalog_test.last4(value TEXT, keep INT DEFAULT 4) RETURNS TEXT
+                     LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT right(value, keep) $$;
+                 CREATE FUNCTION catalog_test.ssns() RETURNS TABLE (person BIGINT, ssn TEXT)
+                     LANGUAGE sql STABLE SECURITY DEFINER SET search_path = catalog_test
+                     BEGIN ATOMIC SELECT id, ssn FROM catalog_test.people; END;
+                 CREATE FUNCTION catalog_test.same(a TEXT, b TEXT) RETURNS BOOLEAN LANGUAGE sql AS 'SELECT a = b';
+                 CREATE OPERATOR catalog_test.=== (LEFTARG = TEXT, RIGHTARG = TEXT, FUNCTION = catalog_test.same);
+                 CREATE ROLE catalog_test_reader NOLOGIN;
+                 GRANT USAGE ON SCHEMA catalog_test TO catalog_test_reader;
+                 GRANT SELECT (id) ON catalog_test.people TO catalog_test_reader",
+            )
+            .await
+            .unwrap();
+        // Vanilla Postgres has no label provider, so add the label directly.
+        server
+            .execute_checked(
+                "INSERT INTO pg_seclabel VALUES \
+                 ('catalog_test.people'::regclass, 'pg_class'::regclass, 2, 'pgdog', 'pii.ssn')",
+            )
+            .await
+            .unwrap();
+
+        let standard = Schema::load_with(&mut server, CatalogDetail::Standard)
+            .await
+            .unwrap();
+        assert!(!standard.full_catalog);
+        assert!(standard.functions.is_empty());
+        let people = standard.get("catalog_test", "people").unwrap();
+        assert!(people.definition.is_none());
+        assert_eq!(people.columns["ssn"].comment, None);
+
+        let full = Schema::load_with(&mut server, CatalogDetail::Full)
+            .await
+            .unwrap();
+        assert!(full.full_catalog);
+
+        let people = full.get("catalog_test", "people").unwrap();
+        let columns: Vec<_> = people.column_names().collect();
+        assert_eq!(columns, ["id", "ssn", "tags"]);
+        let ssn = &people.columns["ssn"];
+        // data_type matches information_schema; type_name is format_type.
+        assert_eq!(ssn.data_type, "character varying");
+        assert_eq!(ssn.type_name, "character varying");
+        assert_eq!(people.columns["tags"].data_type, "ARRAY");
+        assert_eq!(people.columns["tags"].type_name, "text[]");
+        assert!(people.columns["id"].is_primary_key);
+        assert_eq!(
+            ssn.comment.as_deref(),
+            Some("Social security number. pgdog:tag=pii.ssn")
+        );
+        assert_eq!(
+            ssn.security_labels,
+            [SecurityLabel {
+                provider: "pgdog".into(),
+                label: "pii.ssn".into(),
+            }]
+        );
+
+        // Definitions are schema-qualified regardless of the search_path.
+        let view = full.get("catalog_test", "people_ssn").unwrap();
+        assert!(view.is_view());
+        let definition = view.definition.as_deref().unwrap();
+        assert!(
+            definition.contains("FROM catalog_test.people"),
+            "{definition}"
+        );
+        assert_eq!(view.options, ["security_barrier=true"]);
+        let matview = full.get("catalog_test", "people_count").unwrap();
+        assert!(matview.is_materialized_view());
+        assert!(matview.definition.is_some());
+
+        let function = |name: &str| {
+            full.functions
+                .iter()
+                .find(|function| function.schema == "catalog_test" && function.name == name)
+                .unwrap()
+        };
+        let last4 = function("last4");
+        assert_eq!(last4.kind, "function");
+        assert_eq!(last4.language, "sql");
+        assert_eq!(last4.argument_types, ["text", "integer"]);
+        assert_eq!(last4.argument_names, ["value", "keep"]);
+        assert_eq!(last4.argument_defaults, 1);
+        assert_eq!(last4.return_type, "text");
+        assert!(!last4.returns_set);
+        assert_eq!(last4.volatility, "immutable");
+        assert!(last4.strict);
+        assert!(!last4.security_definer);
+        assert!(last4.source.contains("right(value, keep)"));
+        assert!(last4.sql_body.is_none());
+        assert!(last4.config.is_empty());
+
+        let ssns = function("ssns");
+        assert!(ssns.returns_set);
+        assert!(ssns.security_definer);
+        assert_eq!(ssns.result, "TABLE(person bigint, ssn text)");
+        assert_eq!(ssns.output_names, ["person", "ssn"]);
+        assert_eq!(ssns.output_types, ["bigint", "text"]);
+        assert_eq!(ssns.config, ["search_path=catalog_test"]);
+        let body = ssns.sql_body.as_deref().unwrap();
+        assert!(body.contains("FROM catalog_test.people"), "{body}");
+
+        let operator = full
+            .operators
+            .iter()
+            .find(|operator| operator.schema == "catalog_test")
+            .unwrap();
+        assert_eq!(operator.name, "===");
+        assert_eq!(operator.left_type.as_deref(), Some("text"));
+        assert_eq!(operator.right_type.as_deref(), Some("text"));
+        assert_eq!(operator.result_type, "boolean");
+        assert_eq!(operator.function_schema, "catalog_test");
+        assert_eq!(operator.function_name, "same");
+
+        assert!(full.system_functions.iter().any(|name| name == "lower"));
+        assert!(!full.system_functions.iter().any(|name| name == "last4"));
+
+        // information_schema hides columns the role can't access; pg_attribute doesn't.
+        server
+            .execute_checked("SET LOCAL ROLE catalog_test_reader")
+            .await
+            .unwrap();
+        let standard = Schema::load_with(&mut server, CatalogDetail::Standard)
+            .await
+            .unwrap();
+        let visible: Vec<_> = standard
+            .get("catalog_test", "people")
+            .unwrap()
+            .column_names()
+            .collect();
+        assert_eq!(visible, ["id"]);
+        let full = Schema::load_with(&mut server, CatalogDetail::Full)
+            .await
+            .unwrap();
+        let visible: Vec<_> = full
+            .get("catalog_test", "people")
+            .unwrap()
+            .column_names()
+            .collect();
+        assert_eq!(visible, ["id", "ssn", "tags"]);
+
+        // The empty search_path used for loading doesn't leak into the transaction.
+        let search_path = server
+            .fetch_all::<String>("SHOW search_path")
+            .await
+            .unwrap();
+        assert_ne!(search_path, [String::from("\"\"")]);
+
+        server.execute_checked("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_load_full_catalog_outside_transaction() {
+        use super::CatalogDetail;
+
+        let mut server = test_server().await;
+        let before = server
+            .fetch_all::<String>("SHOW search_path")
+            .await
+            .unwrap();
+        let schema = Schema::load_with(&mut server, CatalogDetail::Full)
+            .await
+            .unwrap();
+        assert!(schema.full_catalog);
+        assert!(!server.in_transaction());
+        let after = server
+            .fetch_all::<String>("SHOW search_path")
+            .await
+            .unwrap();
+        assert_eq!(before, after);
     }
 }
