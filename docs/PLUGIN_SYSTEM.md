@@ -2,7 +2,9 @@
 
 This document summarizes PgDog's plugin system: architecture, execution flow, integration points, and key development guidelines. For full details, see the referenced source files.
 
-PgDog plugins are Rust shared libraries loaded at runtime, allowing custom query routing. FFI is used for safe communication, with strict version checks for safety.
+PgDog plugins are Rust shared libraries loaded at runtime. They can route queries, rewrite or block statements before PgDog parses them, transform the results sent back to clients, and receive database schema snapshots. FFI is used for safe communication, with strict version checks for safety.
+
+This document describes plugin API 0.6 (`pgdog-plugin` 0.6). The hooks added in 0.6 are covered in [Hooks and capabilities](#hooks-and-capabilities).
 
 ## Architecture
 
@@ -120,6 +122,98 @@ Process exits
 
 **Location**: `pgdog/src/plugin/mod.rs` lines 77-83
 
+## Hooks and capabilities
+
+A plugin declares which hooks it implements by returning a set of [`Capabilities`](../pgdog-plugin/src/capabilities.rs) from `Plugin::capabilities()`. PgDog only calls the hooks a plugin asked for, so a routing-only plugin pays nothing for the others. The default is `Capabilities::ROUTE`, which is how plugins behaved before 0.6.
+
+| Capability | Hook | Called |
+|---|---|---|
+| `ROUTE` | `route(Context) -> Route` | For every statement PgDog routes, after parsing. |
+| `STATEMENT` | `statement(StatementContext) -> StatementOutput` | For every `Query`, `Parse`, `Bind` and fast-path `FunctionCall`, before PgDog parses, rewrites or routes the statement. |
+| `TRANSFORM` | `transform(TransformContext) -> TransformOutput` | For server messages of statements the plugin attached a transform to. |
+| `SCHEMA` | `schema(database, epoch, snapshot)` | When a database's schema finishes loading. Makes PgDog load the schema even if `load_schema` would skip it. |
+| `REQUIRED` | none | PgDog refuses to start if this plugin fails its configuration. |
+
+Every plugin also has `reload() -> bool`, called when PgDog reloads its own configuration (`SIGHUP`, or the admin `RELOAD` and `FORCE_RELOAD` commands). Returning `false` means the new configuration is invalid; the plugin should keep its previous one, and PgDog logs a warning.
+
+Capability bits PgDog doesn't know are kept, not dropped, so an older host never misreads a newer plugin.
+
+### Statement hook
+
+Plugins with `STATEMENT` see the SQL the client sent, with the client's identity (the user and database it authenticated as, client address, TLS certificate identity, session id, and the unauthenticated `application_name`), the statement kind and name, `search_path`, and whether the client is in a transaction. They return one of:
+
+- `StatementOutput::cont()`: let the statement through unchanged;
+- `StatementOutput::rewrite(sql, variant_tag)`: replace the SQL. Everything downstream, including the prepared statements cache, the AST cache, the router and sharding, sees the new SQL;
+- `StatementOutput::block(sqlstate, message)`: reject the statement with an `ErrorResponse`.
+
+Plugins run in config order, and each one sees the SQL returned by the previous one. The first block wins.
+
+Blocked statements fail like statements Postgres rejects: the transaction, if any, is aborted (a later `COMMIT` reports `ROLLBACK`), and in the extended protocol everything up to the next `Sync` is discarded. A blocked statement never reaches a server. A plugin that panics or returns invalid output blocks the statement (`XX000`): the hook fails closed.
+
+Prepared statements:
+
+- For `Bind`, `sql` is the statement's **original** SQL, as the client prepared it, not a previous rewrite.
+- `variant_tag` identifies a rewrite. If a later `Bind` returns a different tag than the `Parse` did (e.g., the plugin reloaded its configuration), PgDog prepares the statement again with the new SQL, so long-lived prepared statements follow plugin changes. If it can't (the unnamed statement, or prepared statements aren't handled by PgDog), the `Bind` fails with `26000` and the client must prepare the statement again.
+- Rewrites of a `Parse` or `Bind` must keep the number and types of bind parameters.
+
+Statement plugins are not called for admin database commands, and multi-statement queries PgDog splits internally are rewritten once, as the client sent them.
+
+See [pgdog-plugin/src/statement.rs](../pgdog-plugin/src/statement.rs) and [pgdog/src/frontend/client/query_engine/statement_plugins.rs](../pgdog/src/frontend/client/query_engine/statement_plugins.rs).
+
+### Result transform hook
+
+A statement hook can attach a transform to its output with `with_transform(handle, codes)`, naming the server message codes it wants (e.g., `'D'` for `DataRow`, `'T'` for `RowDescription`, `'E'` for `ErrorResponse`). The plugin needs the `TRANSFORM` capability; transforms from plugins without it are released and ignored.
+
+PgDog then calls `transform` with the handle for each matching message, after multi-shard results have been merged, sorted and aggregated, i.e., with exactly the messages the client would receive. The context has the message body (without the code and length header) and the result column formats from the client's `Bind` (empty for simple queries, where every column is text; one code applies to all columns, otherwise there's one per column). The plugin can forward the message, replace its body, or fail. Failing, or panicking, closes the client connection with a `FATAL` error and cancels the query, since some rows may already have been sent. Replication streams are not passed to transforms.
+
+#### Transform ownership
+
+A handle belongs to the statement output it was returned with, and PgDog releases it with `release_transform` exactly once, when that ends:
+
+- a `Query` or fast-path call: at its `ReadyForQuery`, after any COPY data exchanged in between;
+- a `Parse`: when the prepared statement is closed, replaced, or destroyed by a simple query (the unnamed statement), or the client disconnects. `Describe` responses go through it;
+- a `Bind`: when the portal is closed, replaced, or destroyed by a simple query (the unnamed portal), or the transaction ends, or the client disconnects. Every `Execute` of the portal, including resumed ones, goes through it.
+
+Handles are only identifiers, and must not be zero. A plugin may return the same value for several statements; it's then released once for each time it was returned.
+
+See [pgdog-plugin/src/transform.rs](../pgdog-plugin/src/transform.rs).
+
+### Concurrency
+
+PgDog serves clients on many threads, and calls hooks from all of them:
+
+- `route`, `statement` and `transform` run concurrently for different clients. For one client, they're called one at a time, in the order of the client's messages and the server's responses.
+- `schema` and `reload` can run at any time, concurrently with the other hooks.
+- `release_transform` runs on the thread of the client that owned the transform, or on the thread dropping its session.
+
+Plugins must make their own state safe to share across threads. Hooks run on PgDog's async workers, so they must not block.
+
+The authoritative version of these contracts is the documentation of the `Plugin` trait in [pgdog-plugin/src/plugin.rs](../pgdog-plugin/src/plugin.rs).
+
+### Schema snapshots
+
+Plugins with `SCHEMA` receive each database's schema as JSON: `pgdog_stats::Schema` with the full catalog (columns from `pg_attribute`, not filtered by the loading role's privileges, with their type names, comments and security labels; view definitions and options; non-system functions and operators). Names in view definitions, function bodies and type names are schema-qualified.
+
+The JSON object has a `format_version` field, currently `1` (`pgdog_plugin::SCHEMA_SNAPSHOT_VERSION`). It changes whenever the format changes incompatibly, and plugins should reject versions they don't know.
+
+A snapshot is sent each time a database's schema finishes loading: at startup, after configuration reloads, and after DDL when `reload_schema_on_ddl` is enabled. `epoch` increases with every snapshot, across all databases, so a plugin can ignore one older than what it has. If loading fails, PgDog retries and sends nothing until it succeeds: plugins keep their previous snapshot, and must decide for themselves what to do for a database they have no snapshot for yet. A security plugin should fail closed.
+
+### Required plugins
+
+By default, PgDog logs a warning and starts without a plugin that fails to load. A plugin can be made required, so PgDog refuses to start without it, in two ways:
+
+- `required = true` in its `[[plugins]]` entry: PgDog doesn't start if the plugin fails to load for any reason (the shared library is missing, it was built with a different compiler or plugin API version, or it rejected its configuration);
+- the `REQUIRED` capability: the plugin itself says PgDog must not run without it. Capabilities can only be read once the version checks pass, so this covers the plugin rejecting its configuration; use `required = true` to also cover loading failures.
+
+```toml
+[[plugins]]
+name = "my_security_plugin"
+config = "/etc/pgdog/my_security_plugin.toml"
+required = true
+```
+
+Use this for plugins that enforce security policies, so PgDog never serves traffic without them.
+
 ## Plugin Development
 
 1. **Create a Rust library** with `crate-type = ["cdylib"]` in `Cargo.toml`.
@@ -135,7 +229,9 @@ See the [plugins/pgdog-example-plugin/](../plugins/pgdog-example-plugin/) for a 
 
 - **Context creation:** See [pgdog/src/frontend/router/parser/context.rs](../pgdog/src/frontend/router/parser/context.rs) for how plugin context is built.
 - **Plugin execution:** See [pgdog/src/frontend/router/parser/query/plugins.rs](../pgdog/src/frontend/router/parser/query/plugins.rs) for plugin invocation logic.
-- **Configuration:** Plugins are listed in `pgdog.toml` (see [pgdog-config/src/users.rs](../pgdog-config/src/users.rs)). The `name` field can be a library name, relative, or absolute path.
+- **Statement and transform hooks:** See [pgdog/src/frontend/client/query_engine/statement_plugins.rs](../pgdog/src/frontend/client/query_engine/statement_plugins.rs).
+- **Schema snapshots and reload:** See [pgdog/src/plugin/mod.rs](../pgdog/src/plugin/mod.rs).
+- **Configuration:** Plugins are listed in `pgdog.toml` (see [pgdog-config/src/users.rs](../pgdog-config/src/users.rs)). The `name` field can be a library name, relative, or absolute path. `config` is an optional path to a plugin-specific configuration file, and `required` makes PgDog refuse to start without the plugin.
 
 ## Safety & Compatibility
 
@@ -170,10 +266,10 @@ See the original design notes and migration checklist in the source for more det
 ## Performance & Best Practices
 
 - Keep `init()` fast; it blocks startup.
-- `route()` runs on async executor; avoid blocking.
+- All hooks run on the async executor; avoid blocking. See [Concurrency](#concurrency).
 - Plugins are checked in order; first to return a route wins.
-- Plugins must not panic; always return a valid `Route`.
-- Plugins cannot modify query parsing, only routing.
+- Plugins must not panic. Panics are caught inside the plugin: a panicking `statement` hook blocks the statement and a panicking `transform` closes the client connection.
+- Only declare the capabilities you implement: the statement and transform hooks are on the path of every statement and every server message.
 
 ## Debugging
 
@@ -193,9 +289,10 @@ See [plugins/pgdog-example-plugin/](../plugins/pgdog-example-plugin/) for a work
 The `integration/plugins` directory contains a small test harness and several test-plugin crates used to exercise plugin loading, FFI parameter passing, and API compatibility checks. Key files and behavior:
 
 - **Test harness**: [integration/plugins/extended_spec.rb](../integration/plugins/extended_spec.rb) — an RSpec script that opens multiple connections to PgDog and issues prepared statements (parameterized queries). It verifies query results and that a plugin marker file was created to confirm the plugin's `route()` was invoked.
+- **Hooks**: [integration/plugins/hooks_spec.rb](../integration/plugins/hooks_spec.rb) — exercises the statement and transform hooks of `test-plugin-compatible` through the compiled shared library: rewrites (simple, extended and prepared), blocks (including a blocked statement aborting its transaction), and a `DataRow` transform that respects the `Bind` result formats.
 - **Runner**: [integration/plugins/run.sh](../integration/plugins/run.sh) — builds the test plugins, sets `LD_LIBRARY_PATH` to include the test build outputs, starts PgDog using the integration helpers, runs the RSpec test, and stops PgDog.
 - **Test plugins**: [integration/plugins/test-plugins/](../integration/plugins/test-plugins)
-	- `test-plugin-compatible` — built with the same `pgdog-plugin` ABI; its `route()` calls `assert_context_compatible!()` and writes `route-called.test` the first time it is invoked. The RSpec test checks for this file to confirm the plugin was executed and parameters were seen.
+	- `test-plugin-compatible` — built with the same `pgdog-plugin` ABI; its `route()` calls `assert_context_compatible!()` and writes `route-called.test` the first time it is invoked. The RSpec test checks for this file to confirm the plugin was executed and parameters were seen. It also implements the statement and transform hooks, acting only on statements containing its markers (`pgdog_plugin_rewrite`, `pgdog_plugin_block`, `pgdog_plugin_uppercase`).
 	- `test-plugin-main` — validates the main-branch plugin API compatibility by calling `assert_context_compatible!()` on the received `Context` (detects breaking API changes between host and plugin crates).
 	- `test-plugin-outdated` — intended to simulate an outdated `pgdog-plugin` dependency so the loader should skip it; currently this crate contains a TODO and does not actively panic if loaded, so it serves as a placeholder for the "outdated plugin" scenario.
 
