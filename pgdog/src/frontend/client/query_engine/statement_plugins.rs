@@ -16,13 +16,15 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+use bytes::{BufMut, BytesMut};
 use pgdog_plugin::{
-    Capabilities, Identity, StatementAction, StatementContext, StatementKind, Transform,
+    Capabilities, Identity, PdSlice, StatementAction, StatementContext, StatementKind, Transform,
+    TransformAction, TransformContext,
 };
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::*;
-use crate::net::{Parse, ProtocolMessage};
+use crate::net::{Format, Parse, Protocol, ProtocolMessage};
 use crate::plugin::{LoadedPlugin, has_capability, with_capability};
 
 /// A client's prepared statement, as the client prepared it.
@@ -60,13 +62,16 @@ pub(super) struct StatementPlugins {
     /// Prepared statements by client statement name ("" is the unnamed statement).
     sources: HashMap<String, StatementSource>,
     /// Transforms for the statement currently executing.
-    pub(super) transforms: Vec<PluginTransform>,
+    transforms: Vec<PluginTransform>,
+    /// Result formats requested by the `Bind` of the statement currently executing.
+    result_formats: Vec<i16>,
 }
 
 impl StatementPlugins {
     /// Release transforms of the previous statement.
-    pub(super) fn release_transforms(&mut self) {
+    fn release_transforms(&mut self) {
         release(self.transforms.drain(..));
+        self.result_formats.clear();
     }
 }
 
@@ -246,6 +251,7 @@ impl QueryEngine {
         // Transforms of statements prepared in this request, by name.
         let mut prepared: HashMap<String, Vec<PluginTransform>> = HashMap::new();
         let mut executing: Vec<PluginTransform> = vec![];
+        let mut result_formats: Vec<i16> = vec![];
         let mut unnamed: Option<Parse> = None;
 
         let result = (|| {
@@ -299,6 +305,13 @@ impl QueryEngine {
 
                     ProtocolMessage::Bind(bind) => {
                         let name = bind.statement();
+                        result_formats = bind
+                            .result_formats()
+                            .map(|format| match format {
+                                Format::Text => 0,
+                                Format::Binary => 1,
+                            })
+                            .collect();
 
                         // Prepared in this request: plugins have already seen it.
                         if let Some(transforms) = prepared.remove(name) {
@@ -378,7 +391,83 @@ impl QueryEngine {
         }
 
         state.transforms = executing;
+        state.result_formats = result_formats;
 
         Ok(None)
+    }
+
+    /// Pass a server message to the plugins that attached a transform
+    /// to the statement currently executing.
+    pub(super) async fn transform_server_message(
+        &mut self,
+        context: &mut QueryEngineContext<'_>,
+        message: &mut Message,
+    ) -> Result<(), Error> {
+        if self.statement_plugins.transforms.is_empty() || message.streaming() {
+            return Ok(());
+        }
+
+        let code = message.code();
+
+        for transform in self.statement_plugins.transforms.clone() {
+            if !transform.transform.codes.contains(code) {
+                continue;
+            }
+
+            let action = {
+                let payload = message.payload();
+                transform.plugin.vtable().transform(&TransformContext {
+                    handle: transform.transform.handle,
+                    code: code as u8,
+                    // Skip the code and length header.
+                    payload: PdSlice::from(&payload[5..]),
+                    result_formats: PdSlice::from(self.statement_plugins.result_formats.as_slice()),
+                })
+            };
+
+            match action {
+                Ok(TransformAction::Forward) => (),
+                Ok(TransformAction::Replace(body)) => {
+                    let mut payload = BytesMut::with_capacity(body.len() + 5);
+                    payload.put_u8(code as u8);
+                    payload.put_i32(body.len() as i32 + 4);
+                    payload.put_slice(&body);
+                    message.replace_payload(payload.freeze());
+                }
+                Ok(TransformAction::Fail) | Err(_) => {
+                    let name = transform.plugin.name().to_owned();
+                    error!(
+                        "plugin \"{name}\" failed to transform a '{code}' message, closing connection"
+                    );
+
+                    // Some of the results may already be with the client, so the
+                    // statement can't be completed. Stop the query and the session.
+                    if let Err(err) = self.backend.cancel_query().await {
+                        error!("failed to cancel query after plugin transform failure: {err}");
+                    }
+                    self.backend.force_close();
+                    self.statement_plugins.release_transforms();
+                    context
+                        .stream
+                        .fatal(ErrorResponse {
+                            severity: "FATAL".into(),
+                            ..blocked(
+                                "XX000",
+                                format!("plugin \"{name}\" failed to process the query results"),
+                            )
+                        })
+                        .await?;
+
+                    return Err(Error::PluginTransform(name));
+                }
+            }
+        }
+
+        // The statement is done.
+        if code == 'Z' {
+            self.statement_plugins.release_transforms();
+        }
+
+        Ok(())
     }
 }

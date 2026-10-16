@@ -307,6 +307,10 @@ impl QueryEngine {
             _ => (),
         }
 
+        // Plugins see exactly what the client would, after our own bookkeeping
+        // above read the server's version of the message.
+        self.transform_server_message(context, &mut message).await?;
+
         // Messages that we need to send to the client immediately.
         // ReadyForQuery (B) | CopyInResponse (B) | ErrorResponse(B) | NoticeResponse(B) | NotificationResponse (B)
         let flush = matches!(code, 'Z' | 'G' | 'E' | 'N' | 'A')
