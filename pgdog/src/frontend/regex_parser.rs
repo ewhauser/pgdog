@@ -34,7 +34,18 @@ fn cmd_base_patterns() -> impl Iterator<Item = String> {
         .map(|cmd| format!("{}{}", COMMENT_PREFIX, cmd))
 }
 
+/// Statements that can change what's in the schema plugins receive.
+static CMD_SCHEMA: &[&str] = &["CREATE", "ALTER", "DROP", "COMMENT", "SECURITY"];
+
 static CMD_RE: Lazy<RegexSet> = Lazy::new(|| RegexSet::new(cmd_base_patterns()).unwrap());
+static CMD_RE_SCHEMA: Lazy<RegexSet> = Lazy::new(|| {
+    RegexSet::new(
+        CMD_SCHEMA
+            .iter()
+            .map(|cmd| format!(r"{COMMENT_PREFIX}{cmd}\b")),
+    )
+    .unwrap()
+});
 static CMD_RE_ADVISORY: Lazy<RegexSet> = Lazy::new(|| {
     RegexSet::new(cmd_base_patterns().chain(CMD_ADVISORY.iter().map(|s| s.to_string()))).unwrap()
 });
@@ -77,6 +88,15 @@ impl RegexParser {
         }
 
         false
+    }
+
+    /// Could this request change the schema? Lets PgDog notice DDL, and reload
+    /// the schema, without parsing every statement.
+    pub(crate) fn changes_schema(&self, request: &ClientRequest) -> bool {
+        match request.query() {
+            Ok(Some(query)) => CMD_RE_SCHEMA.is_match(truncate_utf8(query.query(), self.limit)),
+            _ => false,
+        }
     }
 }
 
@@ -308,5 +328,24 @@ mod test {
         assert!(!matches("INSERT INTO users VALUES (1)"));
         assert!(!matches("UPDATE users SET name = 'foo'"));
         assert!(!matches("DELETE FROM users"));
+    }
+
+    #[test]
+    fn test_changes_schema() {
+        let parser = RegexParser::new(General::regex_parser_limit(), QueryParserLevel::Auto);
+        let changes = |query: &str| {
+            parser.changes_schema(&ClientRequest::from(vec![ProtocolMessage::from(
+                Query::new(query),
+            )]))
+        };
+        assert!(changes("COMMENT ON COLUMN users.ssn IS 'pgdog:tag=pii'"));
+        assert!(changes(
+            "security label for pgdog on column users.ssn is 'pii'"
+        ));
+        assert!(changes("/* migration */ CREATE TABLE t (id int)"));
+        assert!(changes("ALTER TABLE t ADD COLUMN x int"));
+        assert!(changes("DROP VIEW v"));
+        assert!(!changes("SELECT 'CREATE TABLE'"));
+        assert!(!changes("CREATED"));
     }
 }

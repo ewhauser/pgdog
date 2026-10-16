@@ -636,6 +636,10 @@ impl Cluster {
                     || self.dry_run()
                     || self.prepared_statements() == &PreparedStatementsLevel::Full
                     || self.regex_parser.use_parser(request)
+                    // Plugins work from the schema: notice DDL so it's reloaded.
+                    || (self.reload_schema()
+                        && plugin::has_capability(Capabilities::CATALOG)
+                        && self.regex_parser.changes_schema(request))
             }
         }
     }
