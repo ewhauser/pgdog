@@ -1,43 +1,51 @@
 //! In-process plugin for testing plugin hooks.
 //!
-//! It only acts on statements containing one of its markers, so loading it
-//! doesn't change the behavior of unrelated tests running in the same process.
+//! It only acts on statements and errors containing one of its markers, so
+//! loading it doesn't change the behavior of unrelated tests running in the
+//! same process.
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pgdog_plugin::{
-    Capabilities, MessageCodes, PdStr, Plugin, PluginVtable, StatementContext, StatementOutput,
-    TransformContext, TransformOutput,
+    Capabilities, ColumnMask, Deny, ErrorFields, MaskBatch, MaskError, MaskId, MaskOutput, PdStr,
+    Plugin, PluginVtable, Redaction, Session, Verdict,
 };
 
 use super::{LoadedPlugin, PLUGINS, Plugins};
 
-/// Statements containing this are blocked.
+/// Statements containing this are denied.
 pub(crate) const BLOCK: &str = "pgdog_test_block";
 /// This is replaced with [`REWRITTEN`].
 pub(crate) const REWRITE: &str = "pgdog_test_rewrite";
 pub(crate) const REWRITTEN: &str = "pgdog_test_rewritten";
-/// This is replaced with `pgdog_test_versioned_{VERSION}`, tagged with [`VERSION`].
+/// This is replaced with `pgdog_test_versioned_{VERSION}`. [`VERSION`] is also
+/// the plugin's generation.
 pub(crate) const VERSIONED: &str = "pgdog_test_version";
-/// Statements containing this get a transform that replaces every DataRow
-/// with a single text column [`TRANSFORMED`].
-pub(crate) const TRANSFORM: &str = "pgdog_test_transform";
-pub(crate) const TRANSFORMED: &str = "transformed";
-/// Blocked on Bind, allowed on Parse.
-pub(crate) const BLOCK_BIND: &str = "pgdog_test_deny_on_bind";
-/// Statements containing this get a transform that fails on RowDescription.
-pub(crate) const FAIL_DESCRIBE: &str = "pgdog_test_fail_describe";
-/// Statements containing this get a transform that fails on ErrorResponse.
-pub(crate) const FAIL_ERROR: &str = "pgdog_test_fail_error";
-/// Statements containing this get a transform that fails.
-pub(crate) const TRANSFORM_FAIL: &str = "pgdog_test_transform_fail";
+/// The first column of these statements is uppercased by the plugin.
+pub(crate) const MASK: &str = "pgdog_test_mask";
+/// Like [`MASK`], with a blocking mask.
+pub(crate) const MASK_BLOCKING: &str = "pgdog_test_slow_mask";
+/// The first column of the second result set is uppercased.
+pub(crate) const MASK_SECOND: &str = "pgdog_test_second_mask";
+/// The first column of these statements is masked, and masking fails.
+pub(crate) const MASK_FAIL: &str = "pgdog_test_failing_mask";
+/// These statements get a parameter the client didn't prepare.
+pub(crate) const BAD_PARAMS: &str = "pgdog_test_bad_params";
+/// Errors containing this are redacted: the marker is replaced with [`REDACTED`],
+/// and the plugin tries to change the SQLSTATE.
+pub(crate) const SECRET: &str = "pgdog_test_secret";
+pub(crate) const REDACTED: &str = "[redacted]";
+/// Redacting errors containing this panics.
+pub(crate) const REDACT_PANIC: &str = "pgdog_test_redact_panic";
 
 /// Simulates a plugin configuration change.
 pub(crate) static VERSION: AtomicU64 = AtomicU64::new(1);
-/// Number of transform handles released.
-pub(crate) static RELEASED: AtomicU64 = AtomicU64::new(0);
+/// Number of times the statement hook saw [`VERSIONED`].
+pub(crate) static VERSIONED_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Number of batches masked.
+pub(crate) static MASK_BATCHES: AtomicU64 = AtomicU64::new(0);
 
-const HANDLE_REPLACE: u64 = 1;
-const HANDLE_FAIL: u64 = 2;
+const UPPERCASE: MaskId = MaskId(1);
+const FAIL: MaskId = MaskId(2);
 
 struct TestPlugin;
 
@@ -47,54 +55,76 @@ impl Plugin for TestPlugin {
     }
 
     fn capabilities() -> Capabilities {
-        Capabilities::STATEMENT | Capabilities::TRANSFORM
+        Capabilities::STATEMENT | Capabilities::MASK | Capabilities::ERRORS
     }
 
-    fn statement(context: StatementContext<'_>) -> StatementOutput {
-        let sql = &*context.sql;
-        if sql.contains(BLOCK_BIND) && context.kind == pgdog_plugin::StatementKind::Bind {
-            return StatementOutput::block("42501", "bind denied");
-        }
-        if sql.contains(FAIL_DESCRIBE) {
-            return StatementOutput::cont()
-                .with_transform(HANDLE_FAIL, MessageCodes::none().with('T'));
-        }
-        if sql.contains(FAIL_ERROR) {
-            return StatementOutput::cont()
-                .with_transform(HANDLE_FAIL, MessageCodes::none().with('E'));
-        }
+    fn statement(session: &Session<'_>, sql: &str) -> Verdict {
+        let mask = |mask: ColumnMask| Verdict::Rewrite {
+            sql: sql.to_owned(),
+            columns: vec![mask],
+        };
+
         if sql.contains(BLOCK) {
-            StatementOutput::block("42501", format!("blocked for {}", &*context.identity.user))
-        } else if sql.contains(TRANSFORM_FAIL) {
-            StatementOutput::cont().with_transform(HANDLE_FAIL, MessageCodes::none().with('D'))
-        } else if sql.contains(TRANSFORM) {
-            StatementOutput::cont().with_transform(HANDLE_REPLACE, MessageCodes::none().with('D'))
+            Verdict::Deny(Deny::insufficient_privilege(format!(
+                "blocked for {}",
+                &*session.user
+            )))
+        } else if sql.contains(MASK_FAIL) {
+            mask(ColumnMask::new(0, FAIL))
+        } else if sql.contains(MASK_BLOCKING) {
+            mask(ColumnMask::new(0, UPPERCASE).blocking())
+        } else if sql.contains(MASK_SECOND) {
+            mask(ColumnMask::new(0, UPPERCASE).in_result(1))
+        } else if sql.contains(MASK) {
+            mask(ColumnMask::new(0, UPPERCASE))
+        } else if sql.contains(BAD_PARAMS) {
+            Verdict::rewrite(format!("{sql}, $9::int"))
         } else if sql.contains(REWRITE) {
-            StatementOutput::rewrite(sql.replace(REWRITE, REWRITTEN), 0)
+            Verdict::rewrite(sql.replace(REWRITE, REWRITTEN))
         } else if sql.contains(VERSIONED) {
+            VERSIONED_CALLS.fetch_add(1, Ordering::Relaxed);
             let version = VERSION.load(Ordering::Relaxed);
-            StatementOutput::rewrite(
-                sql.replace(VERSIONED, &format!("pgdog_test_versioned_{version}")),
-                version,
-            )
+            Verdict::rewrite(sql.replace(VERSIONED, &format!("pgdog_test_versioned_{version}")))
         } else {
-            StatementOutput::cont()
+            Verdict::Allow
         }
     }
 
-    fn transform(context: TransformContext<'_>) -> TransformOutput {
-        if context.handle == HANDLE_FAIL {
-            return TransformOutput::fail();
-        }
-        // DataRow with one text column.
-        let mut body = 1_i16.to_be_bytes().to_vec();
-        body.extend((TRANSFORMED.len() as i32).to_be_bytes());
-        body.extend(TRANSFORMED.as_bytes());
-        TransformOutput::replace(body)
+    fn generation() -> u64 {
+        VERSION.load(Ordering::Relaxed)
     }
 
-    fn release_transform(_handle: u64) {
-        RELEASED.fetch_add(1, Ordering::Relaxed);
+    fn mask_rows(batch: &MaskBatch<'_>, out: &mut MaskOutput) -> Result<(), MaskError> {
+        MASK_BATCHES.fetch_add(1, Ordering::Relaxed);
+        for column in batch.columns() {
+            if column.mask == FAIL {
+                return Err(MaskError::new("test mask failed"));
+            }
+            for value in column.values() {
+                out.push(value.map(|value| value.to_ascii_uppercase()).as_deref());
+            }
+        }
+        Ok(())
+    }
+
+    fn redact_error(_session: &Session<'_>, error: &ErrorFields<'_>) -> Redaction {
+        let fields = error.fields();
+        if fields
+            .iter()
+            .any(|field| field.value.contains(REDACT_PANIC))
+        {
+            panic!("redaction failed");
+        }
+        if !fields.iter().any(|field| field.value.contains(SECRET)) {
+            return Redaction::Keep;
+        }
+        let mut fields: Vec<_> = fields
+            .iter()
+            .map(|field| (field.code, field.value.replace(SECRET, REDACTED)))
+            .collect();
+        // Not allowed: PgDog keeps the original.
+        fields.push((b'C', "00000".into()));
+        Redaction::Replace(fields)
     }
 }
 
@@ -111,6 +141,7 @@ pub(crate) fn load_test_plugin() {
                 capabilities,
             }],
             capabilities,
+            catalog_parts: Default::default(),
         }
     });
 }

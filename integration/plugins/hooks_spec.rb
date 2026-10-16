@@ -3,8 +3,8 @@
 require 'pg'
 require 'rspec'
 
-# Statement and transform hooks of test-plugin-compatible, loaded as a shared library.
-describe 'statement and transform hooks' do
+# Statement, mask and error hooks of test-plugin-compatible, loaded as a shared library.
+describe 'statement, mask and error hooks' do
   let(:conn) { PG.connect('postgres://pgdog:pgdog@127.0.0.1:6432/pgdog') }
 
   after { conn.close }
@@ -62,29 +62,46 @@ describe 'statement and transform hooks' do
     end
   end
 
-  describe 'transform' do
+  describe 'mask' do
     let(:sql) { "SELECT 'secret' AS v, NULL::text AS n, 42 AS i /* pgdog_plugin_uppercase */" }
 
-    it 'transforms simple query rows' do
+    it 'masks simple query rows' do
       row = conn.exec(sql)[0]
       expect(row).to eq('v' => 'SECRET', 'n' => nil, 'i' => '42')
     end
 
-    it 'transforms text rows of prepared statements' do
-      conn.prepare('transform', sql)
+    it 'masks rows of prepared statements' do
+      conn.prepare('mask', sql)
       3.times do
-        expect(conn.exec_prepared('transform')[0]['v']).to eq('SECRET')
+        expect(conn.exec_prepared('mask')[0]['v']).to eq('SECRET')
       end
     end
 
-    it 'passes the result formats from Bind' do
-      # Binary results are left alone.
+    it 'masks text columns requested in binary' do
+      # Text and binary formats of text are the same bytes.
       result = conn.exec_params("SELECT 'secret'::text AS v /* pgdog_plugin_uppercase */", [], 1)
-      expect(result[0]['v']).to eq('secret')
+      expect(result[0]['v']).to eq('SECRET')
     end
 
-    it 'only transforms the statements it was attached to' do
+    it 'masks large results in order' do
+      result = conn.exec("SELECT 'row ' || n FROM generate_series(1, 5000) n /* pgdog_plugin_uppercase */")
+      expect(result.column_values(0)).to eq((1..5000).map { |n| "ROW #{n}" })
+    end
+
+    it 'only masks the statements it was asked to' do
       expect(conn.exec("SELECT 'secret' AS v")[0]['v']).to eq('secret')
+    end
+  end
+
+  describe 'errors' do
+    it 'redacts errors from Postgres' do
+      expect { conn.exec("SELECT 'pgdog_plugin_secret'::int") }
+        .to raise_error(PG::InvalidTextRepresentation) { |error|
+          # libpq quotes the client's own SQL in the message; check what the server sent.
+          primary = error.result.error_field(PG::PG_DIAG_MESSAGE_PRIMARY)
+          expect(primary).not_to include('pgdog_plugin_secret')
+          expect(primary).to include('[redacted]')
+        }
     end
   end
 end

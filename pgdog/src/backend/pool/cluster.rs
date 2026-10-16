@@ -665,11 +665,11 @@ impl Cluster {
         match self.load_schema {
             LoadSchema::On => true,
             // Plugins that need the schema can't work without it.
-            LoadSchema::Off => plugin::has_capability(Capabilities::SCHEMA),
+            LoadSchema::Off => plugin::has_capability(Capabilities::CATALOG),
             LoadSchema::Auto => {
                 self.shards.len() > 1
                     || self.multi_tenant().is_some()
-                    || plugin::has_capability(Capabilities::SCHEMA)
+                    || plugin::has_capability(Capabilities::CATALOG)
             }
         }
     }

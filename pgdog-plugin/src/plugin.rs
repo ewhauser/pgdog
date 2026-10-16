@@ -11,11 +11,12 @@ use std::{
 };
 
 use crate::{
-    Capabilities, Config, Context, PdStr, Route, StatementAction, StatementContext,
-    StatementDecision, StatementOutput, TransformAction, TransformContext, TransformOutput,
+    Access, Capabilities, Catalog, CatalogParts, Config, Context, PdStr, Route, Session, Verdict,
+    catalog,
+    mask::{MASK_ERROR, MASK_OK, MASK_PANIC, MaskBatch, MaskError, MaskOutput, MaskResult},
     parameters::{Parameters, RawParameters},
-    statement::{ACTION_BLOCK, ACTION_CONTINUE, ACTION_PANIC, ACTION_REWRITE},
-    transform::{TRANSFORM_FAIL, TRANSFORM_FORWARD, TRANSFORM_REPLACE},
+    redact::{ErrorFields, REDACT_KEEP, REDACT_PANIC, REDACT_REPLACE, Redaction, RedactionOutput},
+    statement::{VERDICT_ALLOW, VERDICT_DENY, VERDICT_PANIC, VERDICT_REWRITE, VerdictOutput},
 };
 use libloading::{Library, Symbol, library_filename};
 
@@ -57,21 +58,35 @@ pub struct PluginVtable {
     logging_init: extern "C-unwind" fn(Config<'_>),
     /// Hooks implemented by the plugin.
     capabilities: extern "C-unwind" fn() -> u64,
-    /// Rewrite or block a statement.
-    statement: extern "C-unwind" fn(&StatementContext<'_>) -> StatementOutput,
-    /// Free the output of `statement`.
-    free_statement_output: extern "C-unwind" fn(&mut StatementOutput),
-    /// Transform a server message.
-    transform: extern "C-unwind" fn(&TransformContext<'_>) -> TransformOutput,
-    /// Free the output of `transform`.
-    free_transform_output: extern "C-unwind" fn(&mut TransformOutput),
-    /// Release a transform handle.
-    release_transform: extern "C-unwind" fn(u64),
-    /// Receive a schema snapshot.
-    schema: extern "C-unwind" fn(PdStr<'_>, u64, PdStr<'_>),
+    /// Decide what a statement may do.
+    statement: extern "C-unwind" fn(&Session<'_>, PdStr<'_>) -> VerdictOutput,
+    /// Decide whether a fast-path function call may run.
+    function_call: extern "C-unwind" fn(&Session<'_>, u32) -> VerdictOutput,
+    /// Free the output of `statement` and `function_call`.
+    free_verdict: extern "C-unwind" fn(&mut VerdictOutput),
+    /// Generation of the plugin's verdicts.
+    generation: extern "C-unwind" fn() -> u64,
+    /// Mask a batch of rows.
+    mask_rows: extern "C-unwind" fn(&MaskBatch<'_>) -> MaskResult,
+    /// Free the output of `mask_rows`.
+    free_mask_result: extern "C-unwind" fn(&mut MaskResult),
+    /// Redact an error or notice.
+    redact_error: extern "C-unwind" fn(&Session<'_>, &ErrorFields<'_>) -> RedactionOutput,
+    /// Free the output of `redact_error`.
+    free_redaction: extern "C-unwind" fn(&mut RedactionOutput),
+    /// Catalog parts the plugin needs.
+    catalog_parts: extern "C-unwind" fn() -> u32,
+    /// Receive a database's catalog.
+    catalog: CatalogFn,
     /// Reload configuration.
     reload: extern "C-unwind" fn() -> bool,
 }
+
+/// `Catalog` is a Rust type, passed by reference. That's sound because plugins
+/// are built with the same compiler and `pgdog-plugin` version as PgDog,
+/// like the AST passed to `route`.
+#[allow(improper_ctypes_definitions)]
+type CatalogFn = extern "C-unwind" fn(PdStr<'_>, &Catalog);
 
 /// A plugin hook didn't return a usable result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +95,8 @@ pub enum HookError {
     Panicked,
     /// The hook returned output PgDog can't use.
     InvalidOutput(&'static str),
+    /// The hook reported an error.
+    Failed(String),
 }
 
 impl fmt::Display for HookError {
@@ -89,6 +106,7 @@ impl fmt::Display for HookError {
             Self::InvalidOutput(reason) => {
                 write!(f, "plugin hook returned invalid output: {reason}")
             }
+            Self::Failed(reason) => write!(f, "plugin hook failed: {reason}"),
         }
     }
 }
@@ -99,33 +117,21 @@ impl std::error::Error for HookError {}
 ///
 /// # Concurrency
 ///
-/// PgDog serves clients on many threads, and calls hooks from all of them:
-///
-/// - `route`, `statement` and `transform` run concurrently for different clients.
-///   For one client they're called one at a time, in the order of the client's
-///   messages and the server's responses.
-/// - `schema` and `reload` can run at any time, concurrently with the other
-///   hooks.
-/// - `release_transform` runs on the thread of the client that owned the
-///   transform, or on the thread dropping its session.
+/// PgDog serves clients on many threads and calls hooks from all of them at
+/// once. For one client, `statement`, `function_call`, `mask_rows` and
+/// `redact_error` are called one at a time, in the order of the client's
+/// messages and the server's responses. `catalog` and `reload` can run at any
+/// time, concurrently with the other hooks.
 ///
 /// Plugins must make their own state safe to share across threads. Hooks run
-/// on PgDog's async workers, so they must not block.
+/// on PgDog's async workers, so they must not block, except `mask_rows` for
+/// masks declared blocking with [`crate::ColumnMask::blocking`].
 ///
-/// # Transform handles
+/// # Panics
 ///
-/// Every handle `statement` returns with [`StatementOutput::with_transform`] is
-/// owned by what the statement output belongs to, and is released with
-/// `release_transform` exactly once, when that ends:
-///
-/// - a `Query` or fast-path call: at its `ReadyForQuery`, after any COPY data;
-/// - a `Parse`: when the prepared statement is closed, replaced, or destroyed by
-///   a simple query (the unnamed statement), or the client disconnects;
-/// - a `Bind`: when the portal is closed, replaced, or destroyed by a simple
-///   query (the unnamed portal), or the transaction ends, or the client disconnects.
-///
-/// Handles are only identifiers: a plugin may return the same value for
-/// several statements, and is then released once for each time it returned it.
+/// Every hook catches panics inside the plugin. A panic fails closed: the
+/// statement is denied, the result fails, or the error is reduced to its
+/// severity and SQLSTATE.
 pub trait Plugin {
     /// The version of your plugin. You can simply return
     /// `env!("CARGO_PKG_VERSION").into()`
@@ -205,84 +211,125 @@ pub trait Plugin {
         Self::capabilities().bits()
     }
 
-    /// Inspect a statement before PgDog parses it, and rewrite or block it.
+    /// Decide what a statement may do: allow, rewrite or deny it. Called with
+    /// the SQL of every simple `Query` and extended protocol `Parse`.
     /// Requires [`Capabilities::STATEMENT`]. See [`crate::statement`].
-    fn statement(_context: StatementContext<'_>) -> StatementOutput {
-        StatementOutput::cont()
+    fn statement(_session: &Session<'_>, _sql: &str) -> Verdict {
+        Verdict::Allow
     }
 
     #[doc(hidden)]
-    extern "C-unwind" fn statement_raw(context: &StatementContext<'_>) -> StatementOutput {
-        let context = *context;
+    extern "C-unwind" fn statement_raw(session: &Session<'_>, sql: PdStr<'_>) -> VerdictOutput {
         // Panics are caught here, inside the plugin, so the panic
         // payload is freed by the allocator that created it.
-        catch_unwind(AssertUnwindSafe(|| Self::statement(context)))
-            .unwrap_or_else(|_| StatementOutput::panicked())
+        catch_unwind(AssertUnwindSafe(|| Self::statement(session, &sql).into()))
+            .unwrap_or_else(|_| VerdictOutput::panicked())
+    }
+
+    /// Decide whether a fast-path function call may run. Fast-path calls carry
+    /// no SQL, only the function's OID. Requires [`Capabilities::STATEMENT`].
+    fn function_call(_session: &Session<'_>, _function: u32) -> Access {
+        Access::Allow
     }
 
     #[doc(hidden)]
-    extern "C-unwind" fn free_statement_output(output: &mut StatementOutput) {
+    extern "C-unwind" fn function_call_raw(session: &Session<'_>, function: u32) -> VerdictOutput {
+        catch_unwind(AssertUnwindSafe(|| {
+            Self::function_call(session, function).into()
+        }))
+        .unwrap_or_else(|_| VerdictOutput::panicked())
+    }
+
+    #[doc(hidden)]
+    extern "C-unwind" fn free_verdict(output: &mut VerdictOutput) {
         output.free()
     }
 
-    /// Inspect or rewrite a server message of a statement the plugin attached
-    /// a transform to. Requires [`Capabilities::TRANSFORM`]. See [`crate::transform`].
-    fn transform(_context: TransformContext<'_>) -> TransformOutput {
-        TransformOutput::forward()
+    /// Generation of the plugin's verdicts. Change it whenever verdicts given
+    /// earlier may no longer hold, e.g. after loading new configuration or a new
+    /// catalog. PgDog then checks prepared statements again at their next `Bind`.
+    ///
+    /// Called at every `Bind` of a prepared statement, so it must be cheap.
+    fn generation() -> u64 {
+        0
     }
 
     #[doc(hidden)]
-    extern "C-unwind" fn transform_raw(context: &TransformContext<'_>) -> TransformOutput {
-        let context = *context;
-        catch_unwind(AssertUnwindSafe(|| Self::transform(context)))
-            .unwrap_or_else(|_| TransformOutput::fail())
+    extern "C-unwind" fn generation_raw() -> u64 {
+        // A panic forces a re-check.
+        catch_unwind(Self::generation).unwrap_or(u64::MAX)
+    }
+
+    /// Mask a batch of result rows. Write exactly one value into `out` for
+    /// each value in `batch`, column by column. Requires [`Capabilities::MASK`].
+    /// See [`crate::mask`].
+    fn mask_rows(_batch: &MaskBatch<'_>, _out: &mut MaskOutput) -> Result<(), MaskError> {
+        Err(MaskError::new("mask_rows isn't implemented"))
     }
 
     #[doc(hidden)]
-    extern "C-unwind" fn free_transform_output(output: &mut TransformOutput) {
+    extern "C-unwind" fn mask_rows_raw(batch: &MaskBatch<'_>) -> MaskResult {
+        catch_unwind(AssertUnwindSafe(|| {
+            let values = batch.columns().len() * batch.rows as usize;
+            let mut out = MaskOutput::with_capacity(values, values * 16);
+            Self::mask_rows(batch, &mut out).map(|_| out).into()
+        }))
+        .unwrap_or_else(|_| MaskResult::panicked())
+    }
+
+    #[doc(hidden)]
+    extern "C-unwind" fn free_mask_result(output: &mut MaskResult) {
         output.free()
     }
 
-    /// The query, prepared statement or portal a transform was attached to is
-    /// done. PgDog calls this exactly once for each handle `statement` returned.
-    /// See [Transform handles](Plugin#transform-handles).
-    fn release_transform(_handle: u64) {}
-
-    #[doc(hidden)]
-    extern "C-unwind" fn release_transform_raw(handle: u64) {
-        let _ = catch_unwind(AssertUnwindSafe(|| Self::release_transform(handle)));
+    /// Redact an error or notice Postgres sent to the client. Called for all of
+    /// them, whatever statement caused them. Requires [`Capabilities::ERRORS`].
+    /// See [`crate::redact`].
+    fn redact_error(_session: &Session<'_>, _error: &ErrorFields<'_>) -> Redaction {
+        Redaction::Keep
     }
 
-    /// Receive a snapshot of a database's schema, serialized as JSON.
-    /// Requires [`Capabilities::SCHEMA`].
-    ///
-    /// Called when PgDog loads or reloads the schema. `epoch` increases with every
-    /// snapshot PgDog takes, across all databases.
-    ///
-    /// The snapshot is `pgdog_stats::Schema` with the full catalog: columns from
-    /// `pg_attribute` (not filtered by the loading role's privileges), their type
-    /// names, comments and security labels, view definitions and options, and
-    /// non-system functions and operators. Names in view definitions, function
-    /// bodies and type names are schema-qualified.
-    ///
-    /// The JSON object has a `format_version` field, currently
-    /// [`crate::SCHEMA_SNAPSHOT_VERSION`]. It changes whenever the format changes
-    /// incompatibly; plugins should reject versions they don't know.
-    ///
-    /// A snapshot is sent each time a database's schema finishes loading: at
-    /// startup, after configuration reloads, and after DDL when
-    /// `reload_schema_on_ddl` is enabled. Epochs only increase, so a plugin can
-    /// ignore a snapshot older than one it has. If loading fails, PgDog retries
-    /// and sends nothing until it succeeds: plugins keep their previous snapshot,
-    /// and must decide for themselves what to do for a database they have no
-    /// snapshot for yet (a security plugin should fail closed).
-    fn schema(_database: &str, _epoch: u64, _snapshot: &str) {}
+    #[doc(hidden)]
+    extern "C-unwind" fn redact_error_raw(
+        session: &Session<'_>,
+        error: &ErrorFields<'_>,
+    ) -> RedactionOutput {
+        catch_unwind(AssertUnwindSafe(|| {
+            Self::redact_error(session, error).into()
+        }))
+        .unwrap_or_else(|_| RedactionOutput::panicked())
+    }
 
     #[doc(hidden)]
-    extern "C-unwind" fn schema_raw(database: PdStr<'_>, epoch: u64, snapshot: PdStr<'_>) {
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            Self::schema(&database, epoch, &snapshot)
-        }));
+    extern "C-unwind" fn free_redaction(output: &mut RedactionOutput) {
+        output.free()
+    }
+
+    /// Optional catalog parts this plugin needs. Requires [`Capabilities::CATALOG`].
+    fn catalog_parts() -> CatalogParts {
+        CatalogParts::NONE
+    }
+
+    #[doc(hidden)]
+    extern "C-unwind" fn catalog_parts_raw() -> u32 {
+        catch_unwind(Self::catalog_parts)
+            .unwrap_or(CatalogParts::NONE)
+            .bits()
+    }
+
+    /// Receive the catalog of a database. Requires [`Capabilities::CATALOG`].
+    /// See [`crate::catalog`].
+    ///
+    /// If loading fails, PgDog retries and sends nothing until it succeeds:
+    /// plugins keep their previous catalog, and must decide for themselves what
+    /// to do for a database they have no catalog for yet (a security plugin
+    /// should fail closed).
+    fn catalog(_database: &str, _catalog: &Catalog) {}
+
+    #[doc(hidden)]
+    #[allow(improper_ctypes_definitions)]
+    extern "C-unwind" fn catalog_raw(database: PdStr<'_>, catalog: &Catalog) {
+        let _ = catch_unwind(AssertUnwindSafe(|| Self::catalog(&database, catalog)));
     }
 
     /// Reload the plugin's configuration. Called when PgDog reloads its own.
@@ -295,6 +342,47 @@ pub trait Plugin {
     #[doc(hidden)]
     extern "C-unwind" fn reload_raw() -> bool {
         catch_unwind(Self::reload).unwrap_or(false)
+    }
+}
+
+/// Masked values of a batch, borrowed from the plugin until dropped.
+pub struct MaskedValues<'a> {
+    vtable: &'a PluginVtable,
+    result: MaskResult,
+    /// Start of each value in `result.data()`.
+    offsets: Vec<usize>,
+}
+
+impl MaskedValues<'_> {
+    /// The value at `index`, column by column. `None` is NULL.
+    pub fn get(&self, index: usize) -> Option<&[u8]> {
+        let len = *self.result.lengths().get(index)?;
+        let start = self.offsets[index];
+        (len >= 0).then(|| &self.result.data()[start..start + len as usize])
+    }
+
+    /// Number of values.
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    /// No values.
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+}
+
+impl Drop for MaskedValues<'_> {
+    fn drop(&mut self) {
+        (self.vtable.free_mask_result)(&mut self.result)
+    }
+}
+
+impl fmt::Debug for MaskedValues<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries((0..self.len()).map(|index| self.get(index)))
+            .finish()
     }
 }
 
@@ -312,11 +400,15 @@ impl PluginVtable {
             logging_init: T::logging_init,
             capabilities: T::capabilities_raw,
             statement: T::statement_raw,
-            free_statement_output: T::free_statement_output,
-            transform: T::transform_raw,
-            free_transform_output: T::free_transform_output,
-            release_transform: T::release_transform_raw,
-            schema: T::schema_raw,
+            function_call: T::function_call_raw,
+            free_verdict: T::free_verdict,
+            generation: T::generation_raw,
+            mask_rows: T::mask_rows_raw,
+            free_mask_result: T::free_mask_result,
+            redact_error: T::redact_error_raw,
+            free_redaction: T::free_redaction,
+            catalog_parts: T::catalog_parts_raw,
+            catalog: T::catalog_raw,
             reload: T::reload_raw,
         }
     }
@@ -405,77 +497,118 @@ impl PluginVtable {
 
     /// Run the statement hook. Plugin-owned output is copied and freed
     /// before returning.
-    pub fn statement(
-        &self,
-        context: &StatementContext<'_>,
-    ) -> Result<StatementDecision, HookError> {
-        let mut output = (self.statement)(context);
-        let decision = Self::decode_statement(&output);
-        let transform = output.transform();
-        (self.free_statement_output)(&mut output);
+    pub fn statement(&self, session: &Session<'_>, sql: &str) -> Result<Verdict, HookError> {
+        let mut output = (self.statement)(session, sql.into());
+        let verdict = Self::decode_verdict(&output);
+        (self.free_verdict)(&mut output);
+        verdict
+    }
 
-        match decision {
-            Ok(action) => Ok(StatementDecision { action, transform }),
-            Err(err) => {
-                if let Some(transform) = transform {
-                    self.release_transform(transform.handle);
-                }
-                Err(err)
-            }
+    /// Run the fast-path function call hook.
+    pub fn function_call(&self, session: &Session<'_>, function: u32) -> Result<Access, HookError> {
+        let mut output = (self.function_call)(session, function);
+        let verdict = Self::decode_verdict(&output);
+        (self.free_verdict)(&mut output);
+        match verdict? {
+            Verdict::Allow => Ok(Access::Allow),
+            Verdict::Deny(deny) => Ok(Access::Deny(deny)),
+            Verdict::Rewrite { .. } => Err(HookError::InvalidOutput(
+                "a function call can't be rewritten",
+            )),
         }
     }
 
-    fn decode_statement(output: &StatementOutput) -> Result<StatementAction, HookError> {
+    fn decode_verdict(output: &VerdictOutput) -> Result<Verdict, HookError> {
         match output.action() {
-            ACTION_CONTINUE => Ok(StatementAction::Continue),
-            ACTION_REWRITE => {
+            VERDICT_ALLOW => Ok(Verdict::Allow),
+            VERDICT_REWRITE => {
                 let sql = output
                     .sql()
                     .as_str()
                     .ok_or(HookError::InvalidOutput("rewritten SQL is not valid UTF-8"))?;
-                Ok(StatementAction::Rewrite {
+                Ok(Verdict::Rewrite {
                     sql: sql.to_owned(),
-                    variant_tag: output.variant_tag(),
+                    columns: output.columns().to_vec(),
                 })
             }
-            ACTION_BLOCK => {
-                let sqlstate = std::str::from_utf8(output.sqlstate())
-                    .map_err(|_| HookError::InvalidOutput("SQLSTATE is not ASCII"))?;
-                let message = String::from_utf8_lossy(output.message().as_bytes());
-                Ok(StatementAction::Block {
-                    sqlstate: sqlstate.to_owned(),
-                    message: message.into_owned(),
-                })
-            }
-            ACTION_PANIC => Err(HookError::Panicked),
-            _ => Err(HookError::InvalidOutput("unknown statement action")),
+            VERDICT_DENY => Ok(Verdict::Deny(output.denied())),
+            VERDICT_PANIC => Err(HookError::Panicked),
+            _ => Err(HookError::InvalidOutput("unknown verdict")),
         }
     }
 
-    /// Run the transform hook. Plugin-owned output is copied and freed
-    /// before returning.
-    pub fn transform(&self, context: &TransformContext<'_>) -> Result<TransformAction, HookError> {
-        let mut output = (self.transform)(context);
-        let action = match output.action() {
-            TRANSFORM_FORWARD => Ok(TransformAction::Forward),
-            TRANSFORM_REPLACE => Ok(TransformAction::Replace(
-                output.payload().as_bytes().to_vec(),
-            )),
-            TRANSFORM_FAIL => Ok(TransformAction::Fail),
-            _ => Err(HookError::InvalidOutput("unknown transform action")),
+    /// Generation of the plugin's verdicts.
+    pub fn generation(&self) -> u64 {
+        (self.generation)()
+    }
+
+    /// Run the mask hook. The masked values stay in plugin memory until the
+    /// returned [`MaskedValues`] is dropped.
+    pub fn mask_rows(&self, batch: &MaskBatch<'_>) -> Result<MaskedValues<'_>, HookError> {
+        let result = (self.mask_rows)(batch);
+        let mut values = MaskedValues {
+            vtable: self,
+            result,
+            offsets: vec![],
         };
-        (self.free_transform_output)(&mut output);
-        action
+
+        match values.result.status() {
+            MASK_OK => (),
+            MASK_ERROR => return Err(HookError::Failed(values.result.message())),
+            MASK_PANIC => return Err(HookError::Panicked),
+            _ => return Err(HookError::InvalidOutput("unknown mask status")),
+        }
+
+        let expected = batch.columns().len() * batch.rows as usize;
+        let lengths = values.result.lengths();
+        if lengths.len() != expected {
+            return Err(HookError::InvalidOutput(
+                "mask_rows didn't return one value per input value",
+            ));
+        }
+
+        let mut offsets = Vec::with_capacity(expected);
+        let mut offset = 0;
+        for len in lengths {
+            offsets.push(offset);
+            offset += (*len).max(0) as usize;
+        }
+        if offset != values.result.data().len() {
+            return Err(HookError::InvalidOutput("mask_rows output is inconsistent"));
+        }
+        values.offsets = offsets;
+
+        Ok(values)
     }
 
-    /// Release a transform handle.
-    pub fn release_transform(&self, handle: u64) {
-        (self.release_transform)(handle)
+    /// Run the error redaction hook. Returns the replacement fields, if any.
+    pub fn redact_error(
+        &self,
+        session: &Session<'_>,
+        error: &ErrorFields<'_>,
+    ) -> Result<Option<Vec<(u8, String)>>, HookError> {
+        let mut output = (self.redact_error)(session, error);
+        let result = match output.action() {
+            REDACT_KEEP => Ok(None),
+            REDACT_REPLACE => output
+                .fields()
+                .map(Some)
+                .ok_or(HookError::InvalidOutput("malformed error fields")),
+            REDACT_PANIC => Err(HookError::Panicked),
+            _ => Err(HookError::InvalidOutput("unknown redaction")),
+        };
+        (self.free_redaction)(&mut output);
+        result
     }
 
-    /// Send a schema snapshot.
-    pub fn schema(&self, database: &str, epoch: u64, snapshot: &str) {
-        (self.schema)(database.into(), epoch, snapshot.into())
+    /// Catalog parts the plugin needs.
+    pub fn catalog_parts(&self) -> CatalogParts {
+        CatalogParts::from_bits((self.catalog_parts)())
+    }
+
+    /// Send a database's catalog.
+    pub fn catalog(&self, database: &str, catalog: &catalog::Catalog) {
+        (self.catalog)(database.into(), catalog)
     }
 
     /// Reload plugin configuration.
@@ -487,7 +620,10 @@ impl PluginVtable {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{Identity, MessageCodes, PdSlice, StatementKind};
+    use crate::{
+        ColumnMask, Deny, MaskColumn, MaskId, SqlState, Value,
+        redact::{ErrorField, field},
+    };
 
     struct TestPlugin;
 
@@ -497,102 +633,177 @@ mod test {
         }
 
         fn capabilities() -> Capabilities {
-            Capabilities::STATEMENT | Capabilities::TRANSFORM
+            Capabilities::STATEMENT | Capabilities::MASK | Capabilities::ERRORS
         }
 
-        fn statement(context: StatementContext<'_>) -> StatementOutput {
-            match &*context.sql {
+        fn statement(session: &Session<'_>, sql: &str) -> Verdict {
+            match sql {
                 "panic" => panic!("statement hook panicked"),
-                "block" => StatementOutput::block("42501", "blocked"),
-                "transform" => {
-                    StatementOutput::cont().with_transform(7, MessageCodes::none().with('D'))
-                }
-                sql => {
-                    StatementOutput::rewrite(format!("{sql} /* {} */", &*context.identity.user), 42)
-                }
+                "deny" => Verdict::Deny(Deny::insufficient_privilege("denied")),
+                "mask" => Verdict::Rewrite {
+                    sql: "SELECT 1".into(),
+                    columns: vec![ColumnMask::new(1, MaskId(9))],
+                },
+                sql => Verdict::rewrite(format!("{sql} /* {} */", &*session.user)),
             }
         }
 
-        fn transform(context: TransformContext<'_>) -> TransformOutput {
-            match context.payload.as_slice() {
-                b"panic" => panic!("transform hook panicked"),
-                b"fail" => TransformOutput::fail(),
-                b"keep" => TransformOutput::forward(),
-                payload => TransformOutput::replace(payload.iter().rev().copied().collect()),
+        fn function_call(_session: &Session<'_>, function: u32) -> Access {
+            match function {
+                0 => Access::Deny(Deny::new(SqlState::FEATURE_NOT_SUPPORTED, "no")),
+                _ => Access::Allow,
+            }
+        }
+
+        fn generation() -> u64 {
+            7
+        }
+
+        fn mask_rows(batch: &MaskBatch<'_>, out: &mut MaskOutput) -> Result<(), MaskError> {
+            for column in batch.columns() {
+                for value in column.values() {
+                    match value {
+                        Some(b"panic") => panic!("mask hook panicked"),
+                        Some(b"fail") => return Err(MaskError::new("can't mask")),
+                        Some(b"short") => return Ok(()),
+                        Some(value) => out.push(Some(&value.to_ascii_uppercase())),
+                        None => out.push(None),
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn redact_error(_session: &Session<'_>, error: &ErrorFields<'_>) -> Redaction {
+            match error.message() {
+                Some("panic") => panic!("redact hook panicked"),
+                Some("keep") => Redaction::Keep,
+                _ => Redaction::Replace(error.without(&[field::DETAIL])),
             }
         }
     }
 
     static VTABLE: PluginVtable = PluginVtable::from_plugin::<TestPlugin>();
 
-    fn statement(sql: &str) -> Result<StatementDecision, HookError> {
-        let context = StatementContext {
-            identity: Identity {
-                user: "alice".into(),
-                ..Default::default()
-            },
-            kind: StatementKind::Query,
-            sql: sql.into(),
-            statement_name: "".into(),
-            search_path: "".into(),
-            in_transaction: false,
-        };
-        VTABLE.statement(&context)
+    fn session() -> Session<'static> {
+        Session {
+            user: "alice".into(),
+            ..Default::default()
+        }
     }
 
-    fn transform(payload: &[u8]) -> Result<TransformAction, HookError> {
-        VTABLE.transform(&TransformContext {
-            handle: 7,
-            code: b'D',
-            payload: PdSlice::from(payload),
-            result_formats: PdSlice::default(),
-        })
+    fn mask(values: &[Option<&[u8]>]) -> Result<Vec<Option<Vec<u8>>>, HookError> {
+        let values: Vec<_> = values.iter().map(|value| Value::new(*value)).collect();
+        let columns = [MaskColumn::new(0, MaskId(1), &values)];
+        let batch = MaskBatch::new(values.len() as u32, &columns);
+        let masked = VTABLE.mask_rows(&batch)?;
+        Ok((0..masked.len())
+            .map(|index| masked.get(index).map(|value| value.to_vec()))
+            .collect())
     }
 
     #[test]
     fn test_capabilities() {
         assert_eq!(
             VTABLE.capabilities(),
-            Capabilities::STATEMENT | Capabilities::TRANSFORM
+            Capabilities::STATEMENT | Capabilities::MASK | Capabilities::ERRORS
         );
+        assert_eq!(VTABLE.generation(), 7);
+        assert_eq!(VTABLE.catalog_parts(), CatalogParts::NONE);
     }
 
     #[test]
     fn test_statement_hook() {
+        let session = session();
         assert_eq!(
-            statement("SELECT 1").unwrap(),
-            StatementDecision {
-                action: StatementAction::Rewrite {
-                    sql: "SELECT 1 /* alice */".into(),
-                    variant_tag: 42,
-                },
-                transform: None,
+            VTABLE.statement(&session, "SELECT 1").unwrap(),
+            Verdict::rewrite("SELECT 1 /* alice */")
+        );
+        assert_eq!(
+            VTABLE.statement(&session, "deny").unwrap(),
+            Verdict::Deny(Deny::insufficient_privilege("denied"))
+        );
+        assert_eq!(
+            VTABLE.statement(&session, "mask").unwrap(),
+            Verdict::Rewrite {
+                sql: "SELECT 1".into(),
+                columns: vec![ColumnMask::new(1, MaskId(9))],
             }
         );
         assert_eq!(
-            statement("block").unwrap().action,
-            StatementAction::Block {
-                sqlstate: "42501".into(),
-                message: "blocked".into(),
-            }
+            VTABLE.statement(&session, "panic"),
+            Err(HookError::Panicked)
         );
-        let decision = statement("transform").unwrap();
-        assert_eq!(decision.action, StatementAction::Continue);
-        let transform = decision.transform.unwrap();
-        assert_eq!(transform.handle, 7);
-        assert!(transform.codes.contains('D'));
-        assert_eq!(statement("panic"), Err(HookError::Panicked));
     }
 
     #[test]
-    fn test_transform_hook() {
+    fn test_function_call_hook() {
+        let session = session();
+        assert_eq!(VTABLE.function_call(&session, 1).unwrap(), Access::Allow);
         assert_eq!(
-            transform(b"abc").unwrap(),
-            TransformAction::Replace(b"cba".to_vec())
+            VTABLE.function_call(&session, 0).unwrap(),
+            Access::Deny(Deny::new(SqlState::FEATURE_NOT_SUPPORTED, "no"))
         );
-        assert_eq!(transform(b"keep").unwrap(), TransformAction::Forward);
-        assert_eq!(transform(b"fail").unwrap(), TransformAction::Fail);
-        // Panics fail closed.
-        assert_eq!(transform(b"panic").unwrap(), TransformAction::Fail);
+    }
+
+    #[test]
+    fn test_mask_hook() {
+        assert_eq!(
+            mask(&[Some(b"abc"), None, Some(b"")]).unwrap(),
+            [Some(b"ABC".to_vec()), None, Some(vec![])]
+        );
+        assert_eq!(
+            mask(&[Some(b"fail")]).unwrap_err(),
+            HookError::Failed("can't mask".into())
+        );
+        assert_eq!(mask(&[Some(b"panic")]).unwrap_err(), HookError::Panicked);
+        assert!(matches!(
+            mask(&[Some(b"ok"), Some(b"short")]).unwrap_err(),
+            HookError::InvalidOutput(_)
+        ));
+    }
+
+    #[test]
+    fn test_redact_hook() {
+        let error = |message: &'static str| {
+            vec![
+                ErrorField {
+                    code: field::SQLSTATE,
+                    value: "23505".into(),
+                },
+                ErrorField {
+                    code: field::MESSAGE,
+                    value: message.into(),
+                },
+                ErrorField {
+                    code: field::DETAIL,
+                    value: "secret".into(),
+                },
+            ]
+        };
+        let session = session();
+
+        let fields = error("duplicate");
+        assert_eq!(
+            VTABLE
+                .redact_error(&session, &ErrorFields::new(false, &fields))
+                .unwrap(),
+            Some(vec![
+                (field::SQLSTATE, "23505".into()),
+                (field::MESSAGE, "duplicate".into())
+            ])
+        );
+        let fields = error("keep");
+        assert_eq!(
+            VTABLE
+                .redact_error(&session, &ErrorFields::new(false, &fields))
+                .unwrap(),
+            None
+        );
+        let fields = error("panic");
+        assert_eq!(
+            VTABLE.redact_error(&session, &ErrorFields::new(false, &fields)),
+            Err(HookError::Panicked)
+        );
     }
 }

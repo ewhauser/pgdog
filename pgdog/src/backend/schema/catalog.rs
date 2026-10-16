@@ -1,4 +1,4 @@
-//! Catalog details loaded only when a plugin needs the schema: view
+//! Catalog parts loaded only for plugins that ask for them: view
 //! definitions, functions, operators and the names of system functions.
 //!
 //! Every query runs with an empty `search_path`, so names in view definitions,

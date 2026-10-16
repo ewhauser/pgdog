@@ -2,11 +2,11 @@
 //!
 //! [`PdSlice`] borrows memory owned by PgDog for the duration of a hook call.
 //!
-//! [`PdBuf`] is memory allocated by the plugin and handed to PgDog in a hook's
+//! [`PdVec`] is memory allocated by the plugin and handed to PgDog in a hook's
 //! output. PgDog and plugins don't share an allocator (PgDog uses jemalloc,
-//! plugins use whatever they were built with), so a [`PdBuf`] must only be
+//! plugins use whatever they were built with), so a [`PdVec`] must only be
 //! freed by the plugin that created it. It deliberately has no `Drop`
-//! implementation: PgDog copies what it needs and then calls the plugin's
+//! implementation: PgDog reads what it needs and then calls the plugin's
 //! `free_*` vtable entry, which runs inside the plugin.
 use std::{marker::PhantomData, mem::ManuallyDrop, ptr, slice, str};
 
@@ -50,18 +50,21 @@ impl<T> Default for PdSlice<'_, T> {
     }
 }
 
-/// Bytes allocated by a plugin and returned to PgDog.
+/// Values allocated by a plugin and returned to PgDog.
 ///
 /// See the module documentation for ownership rules.
 #[repr(C)]
 #[derive(Debug)]
-pub struct PdBuf {
-    data: *mut u8,
+pub struct PdVec<T: Copy> {
+    data: *mut T,
     len: usize,
     capacity: usize,
 }
 
-impl PdBuf {
+/// Bytes allocated by a plugin and returned to PgDog.
+pub type PdBuf = PdVec<u8>;
+
+impl<T: Copy> PdVec<T> {
     /// Empty buffer. Doesn't allocate.
     pub const fn empty() -> Self {
         Self {
@@ -71,18 +74,13 @@ impl PdBuf {
         }
     }
 
-    /// Bytes in the buffer.
-    pub fn as_bytes(&self) -> &[u8] {
+    /// Values in the buffer.
+    pub fn as_slice(&self) -> &[T] {
         if self.data.is_null() {
             return &[];
         }
-        // SAFETY: Constructed from a Vec<u8> with this pointer and length.
+        // SAFETY: Constructed from a Vec<T> with this pointer and length.
         unsafe { slice::from_raw_parts(self.data, self.len) }
-    }
-
-    /// The buffer as UTF-8, if it is valid UTF-8.
-    pub fn as_str(&self) -> Option<&str> {
-        str::from_utf8(self.as_bytes()).ok()
     }
 
     /// Release the memory.
@@ -94,20 +92,32 @@ impl PdBuf {
     pub unsafe fn free(&mut self) {
         let buf = std::mem::take(self);
         if !buf.data.is_null() {
-            // SAFETY: Created from a Vec<u8> with these parts by this binary.
+            // SAFETY: Created from a Vec<T> with these parts by this binary.
             drop(unsafe { Vec::from_raw_parts(buf.data, buf.len, buf.capacity) });
         }
     }
 }
 
-impl Default for PdBuf {
+impl PdVec<u8> {
+    /// Bytes in the buffer.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.as_slice()
+    }
+
+    /// The buffer as UTF-8, if it is valid UTF-8.
+    pub fn as_str(&self) -> Option<&str> {
+        str::from_utf8(self.as_bytes()).ok()
+    }
+}
+
+impl<T: Copy> Default for PdVec<T> {
     fn default() -> Self {
         Self::empty()
     }
 }
 
-impl From<Vec<u8>> for PdBuf {
-    fn from(value: Vec<u8>) -> Self {
+impl<T: Copy> From<Vec<T>> for PdVec<T> {
+    fn from(value: Vec<T>) -> Self {
         if value.capacity() == 0 {
             return Self::empty();
         }
@@ -120,7 +130,7 @@ impl From<Vec<u8>> for PdBuf {
     }
 }
 
-impl From<String> for PdBuf {
+impl From<String> for PdVec<u8> {
     fn from(value: String) -> Self {
         Self::from(value.into_bytes())
     }
@@ -145,6 +155,14 @@ mod test {
         let buf = PdBuf::from(Vec::new());
         assert!(buf.as_bytes().is_empty());
         assert_eq!(buf.as_str(), Some(""));
+    }
+
+    #[test]
+    fn test_pd_vec() {
+        let mut lengths = PdVec::from(vec![3_i32, -1, 0]);
+        assert_eq!(lengths.as_slice(), &[3, -1, 0]);
+        unsafe { lengths.free() };
+        assert!(lengths.as_slice().is_empty());
     }
 
     #[test]

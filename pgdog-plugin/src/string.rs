@@ -34,18 +34,25 @@ impl<'a> From<&'a str> for PdStr<'a> {
     }
 }
 
-impl Deref for PdStr<'_> {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: The returned lifetime is shorter than 'a by definition.
-        // The only way to construct this is from a valid string
+impl<'a> PdStr<'a> {
+    /// The string, for as long as the data it borrows.
+    pub fn as_str(&self) -> &'a str {
+        // SAFETY: The only way to construct this is from a valid string
+        // that outlives 'a.
         unsafe {
             str::from_utf8_unchecked(slice::from_raw_parts(
                 self.data.map(ptr::from_ref).unwrap_or(ptr::dangling()),
                 self.len,
             ))
         }
+    }
+}
+
+impl Deref for PdStr<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
     }
 }
 

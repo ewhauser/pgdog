@@ -17,6 +17,20 @@ async fn test_client() -> TestClient {
     TestClient::new_replicas(Parameters::default()).await
 }
 
+/// First column of every DataRow.
+fn values(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| message.code() == 'D')
+        .map(|row| {
+            DataRow::try_from(row.clone())
+                .unwrap()
+                .get::<String>(0, Format::Text)
+                .unwrap()
+        })
+        .collect()
+}
+
 fn first_value(messages: &[Message]) -> String {
     let row = messages
         .iter()
@@ -151,84 +165,6 @@ async fn test_unnamed_statement_rewritten_across_requests() {
     assert_eq!(first_value(&messages), REWRITTEN);
 }
 
-#[tokio::test]
-async fn test_simple_query_transformed() {
-    let mut client = test_client().await;
-    let released = RELEASED.load(Ordering::Relaxed);
-
-    client
-        .send_simple(Query::new(format!(
-            "SELECT 'secret' AS v, '{TRANSFORM}' AS marker"
-        )))
-        .await;
-    let messages = client.read_until('Z').await.unwrap();
-
-    assert_eq!(first_value(&messages), TRANSFORMED);
-    let row = messages
-        .iter()
-        .find(|message| message.code() == 'D')
-        .unwrap();
-    assert_eq!(DataRow::try_from(row.clone()).unwrap().len(), 1);
-    assert_eq!(
-        RELEASED.load(Ordering::Relaxed),
-        released + 1,
-        "transform released after ReadyForQuery"
-    );
-
-    // Transforms are per statement.
-    client.send_simple(Query::new("SELECT 'plain'")).await;
-    let messages = client.read_until('Z').await.unwrap();
-    assert_eq!(first_value(&messages), "plain");
-}
-
-#[tokio::test]
-async fn test_extended_transformed() {
-    let mut client = test_client().await;
-
-    client
-        .send(Parse::named(
-            "transformed",
-            format!("SELECT 'secret' AS v, '{TRANSFORM}' AS marker"),
-        ))
-        .await;
-    client.send(Bind::new_statement("transformed")).await;
-    client.send(Execute::new()).await;
-    client.send(Sync).await;
-    client.try_process().await.unwrap();
-
-    expect_message!(client.read().await, ParseComplete);
-    let messages = client.read_until('Z').await.unwrap();
-    assert_eq!(first_value(&messages), TRANSFORMED);
-
-    // Executing the prepared statement again still applies the transform.
-    client.send(Bind::new_statement("transformed")).await;
-    client.send(Execute::new()).await;
-    client.send(Sync).await;
-    client.try_process().await.unwrap();
-
-    expect_message!(client.read().await, BindComplete);
-    let messages = client.read_until('Z').await.unwrap();
-    assert_eq!(first_value(&messages), TRANSFORMED);
-}
-
-#[tokio::test]
-async fn test_transform_failure_closes_connection() {
-    let mut client = test_client().await;
-
-    client
-        .send(Query::new(format!("SELECT '{TRANSFORM_FAIL}'")))
-        .await;
-    let result = client.try_process().await;
-    assert!(result.is_err(), "the session ends");
-
-    // RowDescription goes out before the DataRow the plugin fails on.
-    expect_message!(client.read().await, RowDescription);
-    let error = expect_message!(client.read().await, ErrorResponse);
-    assert_eq!(error.severity, "FATAL");
-    assert_eq!(error.code, "XX000");
-    assert!(!client.backend_connected(), "server connection was closed");
-}
-
 /// Admin database commands are PgDog's own and never reach Postgres, so
 /// statement plugins must not see them.
 #[tokio::test]
@@ -295,97 +231,6 @@ async fn test_identity_comes_from_authentication() {
     let after = client.read_until('Z').await.unwrap_err();
     assert_eq!(before.message, after.message);
     assert!(!after.message.contains("impersonated"), "{after:?}");
-}
-
-/// Describe of a prepared statement goes through the transforms attached at Parse.
-#[tokio::test]
-async fn test_describe_uses_statement_transforms() {
-    let mut client = test_client().await;
-    client
-        .send(Parse::named(
-            "described",
-            format!("SELECT '{FAIL_DESCRIBE}'"),
-        ))
-        .await;
-    client.send(Describe::new_statement("described")).await;
-    client.send(Sync).await;
-    assert!(
-        client.try_process().await.is_err(),
-        "the RowDescription transform fails the session"
-    );
-}
-
-/// A suspended portal keeps its transform when it's resumed.
-#[tokio::test]
-async fn test_resumed_portal_keeps_transforms() {
-    let mut client = test_client().await;
-    client.send_simple(Query::new("BEGIN")).await;
-    client.read_until('Z').await.unwrap();
-
-    client
-        .send(Parse::named(
-            "rows",
-            format!("SELECT 'secret', '{TRANSFORM}' FROM generate_series(1, 2)"),
-        ))
-        .await;
-    client
-        .send(Bind::new_name_portal("rows", "rows_portal"))
-        .await;
-    client
-        .send(Execute::new_portal_limit("rows_portal", 1))
-        .await;
-    client.send(Flush).await;
-    client.try_process().await.unwrap();
-    let first = client.read_until('s').await.unwrap();
-    assert_eq!(first_value(&first), TRANSFORMED);
-
-    // Resume in a separate request, without Bind.
-    client
-        .send(Execute::new_portal_limit("rows_portal", 1))
-        .await;
-    client.send(Flush).await;
-    client.try_process().await.unwrap();
-    let second = client.read_until('s').await.unwrap();
-    assert_eq!(first_value(&second), TRANSFORMED);
-
-    // The portal's handle is released when the transaction ends.
-    let released = RELEASED.load(Ordering::Relaxed);
-    client.send(Sync).await;
-    client.try_process().await.unwrap();
-    client.read_until('Z').await.unwrap();
-    client.send_simple(Query::new("COMMIT")).await;
-    client.read_until('Z').await.unwrap();
-    assert!(RELEASED.load(Ordering::Relaxed) > released);
-}
-
-/// COPY data arrives in separate requests; errors from the COPY still go
-/// through the query's transforms.
-#[tokio::test]
-async fn test_copy_errors_use_query_transforms() {
-    use crate::net::{CopyData, CopyDone};
-
-    let mut client = test_client().await;
-    client.send_simple(Query::new("BEGIN")).await;
-    client.read_until('Z').await.unwrap();
-    client
-        .send_simple(Query::new(
-            "CREATE TEMP TABLE copy_transform (id integer CHECK (id > 0), secret text DEFAULT 'secret')",
-        ))
-        .await;
-    client.read_until('Z').await.unwrap();
-
-    client
-        .send_simple(Query::new(format!(
-            "COPY copy_transform (id) FROM STDIN /* {FAIL_ERROR} */"
-        )))
-        .await;
-    client.read_until('G').await.unwrap();
-    client.send(CopyData::new(b"-1\n")).await;
-    client.send(CopyDone).await;
-    assert!(
-        client.try_process().await.is_err(),
-        "the ErrorResponse transform fails the session"
-    );
 }
 
 /// A blocked statement aborts the transaction, like any failed statement.
@@ -462,40 +307,6 @@ async fn test_split_query_rewritten_once() {
     assert_eq!(first_value(&messages), "pgdog_test_versioned_1");
 }
 
-/// Bind is checked even when Parse is in the same request.
-#[tokio::test]
-async fn test_bind_hook_runs_with_parse() {
-    let mut client = test_client().await;
-    client
-        .send(Parse::named("deny_bind", format!("SELECT '{BLOCK_BIND}'")))
-        .await;
-    client.send(Bind::new_statement("deny_bind")).await;
-    client.send(Execute::new()).await;
-    client.send(Sync).await;
-    client.try_process().await.unwrap();
-    let error = client.read_until('Z').await.unwrap_err();
-    assert_eq!(error.message, "bind denied");
-}
-
-/// Closing a prepared statement releases the transforms attached at Parse.
-#[tokio::test]
-async fn test_close_releases_statement_transforms() {
-    let mut client = test_client().await;
-    client
-        .send(Parse::named("closed", format!("SELECT '{TRANSFORM}'")))
-        .await;
-    client.send(Sync).await;
-    client.try_process().await.unwrap();
-    client.read_until('Z').await.unwrap();
-
-    let released = RELEASED.load(Ordering::Relaxed);
-    client.send(Close::named("closed")).await;
-    client.send(Sync).await;
-    client.try_process().await.unwrap();
-    client.read_until('Z').await.unwrap();
-    assert_eq!(RELEASED.load(Ordering::Relaxed), released + 1);
-}
-
 /// PgDog connects lazily, so a block of the first statement after BEGIN fails
 /// the transaction before it has a server connection. COMMIT still rolls back.
 #[tokio::test]
@@ -540,4 +351,292 @@ async fn test_block_first_statement_then_commit() {
     assert_eq!(complete.command(), "ROLLBACK");
     let ready = ReadyForQuery::try_from(messages.last().unwrap().clone()).unwrap();
     assert_eq!(ready.status, 'I');
+}
+
+#[tokio::test]
+async fn test_simple_query_masked() {
+    let mut client = test_client().await;
+
+    client
+        .send_simple(Query::new(format!(
+            "SELECT 'secret' AS v, '{MASK}' AS marker"
+        )))
+        .await;
+    let messages = client.read_until('Z').await.unwrap();
+
+    let row = messages
+        .iter()
+        .find(|message| message.code() == 'D')
+        .unwrap();
+    let row = DataRow::try_from(row.clone()).unwrap();
+    assert_eq!(row.get::<String>(0, Format::Text).unwrap(), "SECRET");
+    // Only the masked column changes.
+    assert_eq!(row.get::<String>(1, Format::Text).unwrap(), MASK);
+
+    // Masks are per statement.
+    client.send_simple(Query::new("SELECT 'plain'")).await;
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(first_value(&messages), "plain");
+}
+
+#[tokio::test]
+async fn test_extended_masked() {
+    let mut client = test_client().await;
+
+    client
+        .send(Parse::named(
+            "masked",
+            format!("SELECT 'secret' AS v, NULL::text AS n, '{MASK}' AS marker"),
+        ))
+        .await;
+    client.send(Bind::new_statement("masked")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+
+    expect_message!(client.read().await, ParseComplete);
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(first_value(&messages), "SECRET");
+
+    // Executing the prepared statement again still masks.
+    client.send(Bind::new_statement("masked")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+
+    expect_message!(client.read().await, BindComplete);
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(first_value(&messages), "SECRET");
+}
+
+/// Large results are masked in batches, in order.
+#[tokio::test]
+async fn test_masked_in_batches() {
+    for marker in [MASK, MASK_BLOCKING] {
+        let mut client = test_client().await;
+        let batches = MASK_BATCHES.load(Ordering::Relaxed);
+
+        client
+            .send_simple(Query::new(format!(
+                "SELECT 'row ' || n || ' {marker}' FROM generate_series(1, 2000) n"
+            )))
+            .await;
+        let messages = client.read_until('Z').await.unwrap();
+
+        let expected: Vec<_> = (1..=2000)
+            .map(|n| format!("ROW {n} {}", marker.to_uppercase()))
+            .collect();
+        assert_eq!(values(&messages), expected);
+        // Other tests mask a few rows at the same time.
+        let batches = MASK_BATCHES.load(Ordering::Relaxed) - batches;
+        assert!(batches < 1000, "{batches} batches for 2000 rows");
+    }
+}
+
+/// Masks apply to the result set they name in multi-statement queries.
+#[tokio::test]
+async fn test_masked_second_result() {
+    let mut client = test_client().await;
+
+    client
+        .send_simple(Query::new(format!(
+            "SELECT 'first'; SELECT 'second' /* {MASK_SECOND} */"
+        )))
+        .await;
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(values(&messages), ["first", "SECOND"]);
+}
+
+#[tokio::test]
+async fn test_mask_failure_closes_connection() {
+    let mut client = test_client().await;
+
+    client
+        .send(Query::new(format!("SELECT '{MASK_FAIL}'")))
+        .await;
+    let result = client.try_process().await;
+    assert!(result.is_err(), "the session ends");
+
+    // RowDescription goes out before the rows the plugin fails on.
+    expect_message!(client.read().await, RowDescription);
+    let error = expect_message!(client.read().await, ErrorResponse);
+    assert_eq!(error.severity, "FATAL");
+    assert_eq!(error.code, "XX000");
+    assert!(!client.backend_connected(), "server connection was closed");
+}
+
+/// Masked columns must be text: checked on the statement's RowDescription.
+#[tokio::test]
+async fn test_masked_column_must_be_text() {
+    let mut client = test_client().await;
+    client
+        .send(Parse::named("not_text", format!("SELECT 1 /* {MASK} */")))
+        .await;
+    client.send(Describe::new_statement("not_text")).await;
+    client.send(Sync).await;
+    assert!(
+        client.try_process().await.is_err(),
+        "masking an integer fails the session"
+    );
+}
+
+/// A suspended portal keeps its masks when it's resumed.
+#[tokio::test]
+async fn test_resumed_portal_keeps_masks() {
+    let mut client = test_client().await;
+    client.send_simple(Query::new("BEGIN")).await;
+    client.read_until('Z').await.unwrap();
+
+    client
+        .send(Parse::named(
+            "rows",
+            format!("SELECT 'secret', '{MASK}' FROM generate_series(1, 2)"),
+        ))
+        .await;
+    client
+        .send(Bind::new_name_portal("rows", "rows_portal"))
+        .await;
+    client
+        .send(Execute::new_portal_limit("rows_portal", 1))
+        .await;
+    client.send(Flush).await;
+    client.try_process().await.unwrap();
+    let first = client.read_until('s').await.unwrap();
+    assert_eq!(first_value(&first), "SECRET");
+
+    // Resume in a separate request, without Bind.
+    client
+        .send(Execute::new_portal_limit("rows_portal", 1))
+        .await;
+    client.send(Flush).await;
+    client.try_process().await.unwrap();
+    let second = client.read_until('s').await.unwrap();
+    assert_eq!(first_value(&second), "SECRET");
+
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    client.read_until('Z').await.unwrap();
+    client.send_simple(Query::new("COMMIT")).await;
+    client.read_until('Z').await.unwrap();
+}
+
+/// Closing a portal right after executing it, in the same request, doesn't
+/// lose the masks of rows still on their way.
+#[tokio::test]
+async fn test_close_after_execute_keeps_masks() {
+    let mut client = test_client().await;
+
+    client
+        .send(Parse::named(
+            "closing",
+            format!("SELECT 'secret', '{MASK}'"),
+        ))
+        .await;
+    client
+        .send(Bind::new_name_portal("closing", "closing_portal"))
+        .await;
+    client.send(Execute::new_portal("closing_portal")).await;
+    client.send(Close::portal("closing_portal")).await;
+    client.send(Close::named("closing")).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(first_value(&messages), "SECRET");
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.code() == '3')
+            .count(),
+        2
+    );
+}
+
+/// The statement is checked again at Bind only when the plugin's generation changes.
+#[tokio::test]
+async fn test_bind_rechecks_only_on_new_generation() {
+    let mut client = test_client().await;
+    let version = VERSION.load(Ordering::Relaxed);
+
+    client
+        .send(Parse::named(
+            "generation",
+            format!("SELECT '{VERSIONED}' AS v, 'generation'"),
+        ))
+        .await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    client.read_until('Z').await.unwrap();
+
+    let calls = VERSIONED_CALLS.load(Ordering::Relaxed);
+    for _ in 0..3 {
+        client.send(Bind::new_statement("generation")).await;
+        client.send(Execute::new()).await;
+        client.send(Sync).await;
+        client.try_process().await.unwrap();
+        let messages = client.read_until('Z').await.unwrap();
+        // Tests share the plugin: the version may move under us.
+        if VERSION.load(Ordering::Relaxed) == version {
+            assert_eq!(
+                first_value(&messages),
+                format!("pgdog_test_versioned_{version}")
+            );
+        }
+    }
+    if VERSION.load(Ordering::Relaxed) == version {
+        assert_eq!(VERSIONED_CALLS.load(Ordering::Relaxed), calls);
+    }
+}
+
+/// A rewrite of a prepared statement can't change its parameters.
+#[tokio::test]
+async fn test_rewrite_must_keep_parameters() {
+    let mut client = test_client().await;
+
+    client
+        .send(Parse::named(
+            "bad_params",
+            format!("SELECT $1::int /* {BAD_PARAMS} */"),
+        ))
+        .await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let error = client.read_until('Z').await.unwrap_err();
+    assert_eq!(error.code, "XX000");
+    assert!(error.message.contains("different parameters"), "{error:?}");
+}
+
+/// Errors from Postgres go through the plugin, which can't change their
+/// severity or SQLSTATE.
+#[tokio::test]
+async fn test_errors_redacted() {
+    let mut client = test_client().await;
+
+    client
+        .send_simple(Query::new(format!("SELECT '{SECRET}'::int")))
+        .await;
+    let error = client.read_until('Z').await.unwrap_err();
+    assert_eq!(error.code, "22P02");
+    assert_eq!(error.severity, "ERROR");
+    assert!(!error.message.contains(SECRET), "{error:?}");
+    assert!(error.message.contains(REDACTED), "{error:?}");
+    expect_message!(client.read().await, ReadyForQuery);
+
+    // Other errors are untouched.
+    client.send_simple(Query::new("SELECT 'other'::int")).await;
+    let error = client.read_until('Z').await.unwrap_err();
+    assert!(error.message.contains("\"other\""), "{error:?}");
+}
+
+/// A plugin that fails to redact an error fails closed.
+#[tokio::test]
+async fn test_redaction_failure_hides_error() {
+    let mut client = test_client().await;
+
+    client
+        .send_simple(Query::new(format!("SELECT '{REDACT_PANIC}'::int")))
+        .await;
+    let error = client.read_until('Z').await.unwrap_err();
+    assert_eq!(error.code, "22P02");
+    assert!(!error.message.contains(REDACT_PANIC), "{error:?}");
 }

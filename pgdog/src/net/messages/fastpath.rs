@@ -13,6 +13,11 @@ impl Fastpath {
     pub(crate) fn len(&self) -> usize {
         self.body.len()
     }
+
+    /// OID of the function to call.
+    pub(crate) fn function_oid(&self) -> Option<u32> {
+        Some(u32::from_be_bytes(self.body.get(..4)?.try_into().ok()?))
+    }
 }
 
 impl FromBytes for Fastpath {

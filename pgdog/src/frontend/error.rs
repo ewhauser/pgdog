@@ -63,8 +63,8 @@ pub(crate) enum Error {
     #[error("terminating connection due to administrator command")]
     AdminTermination,
 
-    #[error("plugin \"{0}\" failed to transform a server message")]
-    PluginTransform(String),
+    #[error("plugin \"{0}\" failed to process the query results")]
+    PluginResults(String),
 
     // FIXME: layer errors better so we don't have
     // to reach so deep into a module.

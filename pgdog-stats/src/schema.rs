@@ -61,13 +61,13 @@ pub struct Column {
     pub is_primary_key: bool,
     pub foreign_keys: Vec<ForeignKey>,
     /// Type name from `format_type`, without typmod and schema-qualified unless
-    /// it's in `pg_catalog`. Only loaded with the full catalog.
+    /// it's in `pg_catalog`. Only loaded for plugins.
     #[serde(default)]
     pub type_name: String,
-    /// `COMMENT ON COLUMN`. Only loaded with the full catalog.
+    /// `COMMENT ON COLUMN`. Only loaded for plugins.
     #[serde(default)]
     pub comment: Option<String>,
-    /// `SECURITY LABEL ON COLUMN`, one per provider. Only loaded with the full catalog.
+    /// `SECURITY LABEL ON COLUMN`, one per provider. Only loaded for plugins.
     #[serde(default)]
     pub security_labels: Vec<SecurityLabel>,
 }
@@ -96,11 +96,11 @@ pub struct Relation {
     /// Columns indexed by name, ordered by ordinal position.
     pub columns: IndexMap<String, Column>,
     /// Query of a view or materialized view, from `pg_get_viewdef`, with every
-    /// name schema-qualified. Only loaded with the full catalog.
+    /// name schema-qualified. Only loaded for plugins.
     #[serde(default)]
     pub definition: Option<String>,
     /// Storage and view options (`reloptions`), e.g. `security_barrier=true`.
-    /// Only loaded with the full catalog.
+    /// Only loaded for plugins.
     #[serde(default)]
     pub options: Vec<String>,
 }
@@ -242,19 +242,13 @@ pub struct SchemaInner {
     pub search_path: Vec<String>,
     pub relations: Relations,
     pub aggregate_functions: HashSet<String>,
-    /// The full catalog was loaded: columns from `pg_attribute` (not filtered by
-    /// privileges), view definitions, comments, security labels, functions and
-    /// operators, and the names of system functions. Only done when a plugin
-    /// needs the schema.
-    #[serde(default)]
-    pub full_catalog: bool,
-    /// Non-system functions. Only loaded with the full catalog.
+    /// Non-system functions. Only loaded for plugins.
     #[serde(default)]
     pub functions: Vec<Function>,
-    /// Non-system operators. Only loaded with the full catalog.
+    /// Non-system operators. Only loaded for plugins.
     #[serde(default)]
     pub operators: Vec<Operator>,
-    /// Names of the functions in `pg_catalog`, sorted. Only loaded with the full catalog.
+    /// Names of the functions in `pg_catalog`, sorted. Only loaded for plugins.
     #[serde(default)]
     pub system_functions: Vec<String>,
 }
@@ -273,7 +267,6 @@ impl Hash for SchemaInner {
                 relation.hash(state);
             }
         }
-        self.full_catalog.hash(state);
         self.functions.hash(state);
         self.operators.hash(state);
         self.system_functions.hash(state);

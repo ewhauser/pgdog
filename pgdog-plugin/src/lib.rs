@@ -177,34 +177,35 @@
 
 pub mod buffer;
 pub mod capabilities;
+pub mod catalog;
 mod config;
 pub mod context;
 pub mod logging;
 pub mod macros;
+pub mod mask;
 pub mod parameters;
 pub mod plugin;
 pub mod prelude;
+pub mod redact;
+pub mod session;
 pub mod statement;
 pub mod string;
-pub mod transform;
 
-pub use buffer::{PdBuf, PdSlice};
+pub use buffer::{PdBuf, PdSlice, PdVec};
 pub use capabilities::Capabilities;
+pub use catalog::{Catalog, CatalogParts};
 pub use config::Config;
 pub use context::*;
+pub use mask::{MaskBatch, MaskColumn, MaskError, MaskOutput, Value};
 pub use parameters::*;
 pub use pgdog_postgres_types::Format as ParameterFormat;
 pub use plugin::*;
-pub use statement::{
-    Identity, MessageCodes, StatementAction, StatementContext, StatementDecision, StatementKind,
-    StatementOutput, Transform,
-};
+pub use redact::{ErrorField, ErrorFields, Redaction};
+pub use session::{ClientInfo, Session};
+pub use statement::{Access, ColumnMask, Deny, MaskId, SqlState, Verdict};
 pub use string::PdStr;
-pub use transform::{TransformAction, TransformContext, TransformOutput};
 
 pub use libloading;
 
 pub const RUSTC_VERSION: &str = env!("RUSTC_VERSION");
-/// Version of the schema snapshot format sent to [`Plugin::schema`].
-pub const SCHEMA_SNAPSHOT_VERSION: u32 = 1;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

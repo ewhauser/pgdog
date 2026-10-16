@@ -1,24 +1,32 @@
-//! Statement hook: rewrite or block statements before PgDog parses them.
+//! Statement hook: rewrite or deny statements before PgDog parses them.
 //!
-//! PgDog calls [`crate::Plugin::statement`] for every `Query`, `Parse`, `Bind` and
-//! fast-path `FunctionCall` a client sends, before its own query parser,
-//! rewrite engine and router run. A plugin can:
+//! PgDog calls [`crate::Plugin::statement`] with the SQL of every simple `Query`
+//! and extended protocol `Parse` a client sends, before its own query parser,
+//! rewrite engine and router run. The plugin returns a [`Verdict`]:
 //!
-//! - let the statement through unchanged ([`StatementOutput::cont`]),
-//! - replace its SQL ([`StatementOutput::rewrite`]); everything downstream in PgDog,
-//!   including sharding, sees the new SQL,
-//! - reject it with an error ([`StatementOutput::block`]).
+//! - [`Verdict::Allow`]: send the statement unchanged;
+//! - [`Verdict::Rewrite`]: send different SQL instead, optionally masking some
+//!   of its result columns with [`crate::Plugin::mask_rows`]. Everything
+//!   downstream in PgDog, including sharding, sees the new SQL;
+//! - [`Verdict::Deny`]: return an error to the client.
 //!
-//! Any of these can carry a result transform ([`StatementOutput::with_transform`]),
-//! which makes PgDog pass the statement's server messages to [`crate::Plugin::transform`].
+//! Fast-path function calls carry no SQL; PgDog asks
+//! [`crate::Plugin::function_call`] instead.
 //!
-//! ### Prepared statements
+//! ### Determinism
 //!
-//! For `Bind`, `sql` is the statement's **original** SQL, as the client
-//! prepared it, not a previous rewrite. The `variant_tag` returned with a
-//! rewrite identifies which rewrite was applied. If a later `Bind` returns a
-//! different tag, PgDog re-prepares the statement with the new SQL, so
-//! long-lived prepared statements follow plugin configuration changes.
+//! A verdict must depend only on the [`crate::Session`] and the SQL, and stay
+//! the same until [`crate::Plugin::generation`] changes. PgDog relies on this to
+//! decide when to ask again: a prepared statement is checked when it's prepared,
+//! and again at `Bind` only if the generation or the session's `search_path`
+//! changed since. If the new verdict sends different SQL, PgDog re-prepares the
+//! statement transparently.
+//!
+//! ### Rewrites
+//!
+//! A rewrite of a `Parse` must keep the statement's bind parameters, since the
+//! client binds values for the statement it prepared: PgDog denies a rewrite
+//! whose highest parameter number (`$n`) differs from the original's.
 //!
 //! ### Example
 //!
@@ -38,182 +46,195 @@
 //!         Capabilities::STATEMENT
 //!     }
 //!
-//!     fn statement(context: StatementContext<'_>) -> StatementOutput {
-//!         if context.sql.contains("secret_table") && &*context.identity.user != "admin" {
-//!             return StatementOutput::block("42501", "permission denied");
+//!     fn statement(session: &Session<'_>, sql: &str) -> Verdict {
+//!         if sql.contains("secret_table") && &*session.user != "admin" {
+//!             return Verdict::Deny(Deny::insufficient_privilege("permission denied"));
 //!         }
-//!         StatementOutput::cont()
+//!         Verdict::Allow
 //!     }
 //! }
 //! ```
-use crate::{PdBuf, PdStr};
+use crate::{PdBuf, PdVec};
 
-/// Who is running the statement. All values come from the client's
-/// authenticated session, except where noted.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Identity<'a> {
-    /// PgDog user the client authenticated as.
-    pub user: PdStr<'a>,
-    /// PgDog database the client connected to.
-    pub database: PdStr<'a>,
-    /// `application_name`. **Set by the client, not authenticated.**
-    pub application_name: PdStr<'a>,
-    /// Client IP address, empty if unknown.
-    pub client_addr: PdStr<'a>,
-    /// Identity from the client's TLS certificate (SAN DNS name, or subject CN),
-    /// empty if the client didn't present one.
-    pub tls_identity: PdStr<'a>,
-    /// Unique identifier of the client connection.
-    pub session_id: u64,
-}
+/// A Postgres SQLSTATE error code: five ASCII digits or uppercase letters.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SqlState([u8; 5]);
 
-/// The protocol message that carried the statement.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatementKind {
-    /// Simple protocol `Query`. May contain several statements.
-    Query = 0,
-    /// Extended protocol `Parse`.
-    Parse = 1,
-    /// Extended protocol `Bind`. `sql` is the prepared statement's original SQL.
-    Bind = 2,
-    /// Fast-path `FunctionCall`. `sql` is empty; the plugin can only block it.
-    FunctionCall = 3,
-}
+impl SqlState {
+    /// `42501`.
+    pub const INSUFFICIENT_PRIVILEGE: Self = Self(*b"42501");
+    /// `0A000`.
+    pub const FEATURE_NOT_SUPPORTED: Self = Self(*b"0A000");
+    /// `XX000`.
+    pub const INTERNAL_ERROR: Self = Self(*b"XX000");
 
-/// Context passed to [`crate::Plugin::statement`].
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct StatementContext<'a> {
-    /// Client identity.
-    pub identity: Identity<'a>,
-    /// Message that carried the statement.
-    pub kind: StatementKind,
-    /// SQL text, exactly as the client sent it.
-    pub sql: PdStr<'a>,
-    /// Prepared statement name used by the client. Empty for the unnamed
-    /// statement and for simple queries.
-    pub statement_name: PdStr<'a>,
-    /// Session `search_path`, empty if the client didn't set one.
-    pub search_path: PdStr<'a>,
-    /// Is the client inside a transaction?
-    pub in_transaction: bool,
-}
-
-/// Bit set of protocol message codes, e.g. `'D'` (DataRow).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MessageCodes([u64; 2]);
-
-impl MessageCodes {
-    /// No messages.
-    pub const fn none() -> Self {
-        Self([0, 0])
+    /// Parse a SQLSTATE. `None` unless it's five ASCII digits or uppercase letters.
+    pub fn new(code: &str) -> Option<Self> {
+        let bytes: [u8; 5] = code.as_bytes().try_into().ok()?;
+        bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+            .then_some(Self(bytes))
     }
 
-    /// Add a message code. Codes are ASCII; others are ignored.
-    pub const fn with(mut self, code: char) -> Self {
-        let code = code as u32;
-        if code < 128 {
-            self.0[(code / 64) as usize] |= 1 << (code % 64);
+    /// The code as a string.
+    pub fn as_str(&self) -> &str {
+        // SAFETY: Only constructed from ASCII.
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+}
+
+/// An error returned to the client instead of running a statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deny {
+    /// SQLSTATE of the error.
+    pub sqlstate: SqlState,
+    /// Error message.
+    pub message: String,
+}
+
+impl Deny {
+    /// Deny with the given SQLSTATE and message.
+    pub fn new(sqlstate: SqlState, message: impl Into<String>) -> Self {
+        Self {
+            sqlstate,
+            message: message.into(),
         }
+    }
+
+    /// Deny with `insufficient_privilege` (42501).
+    pub fn insufficient_privilege(message: impl Into<String>) -> Self {
+        Self::new(SqlState::INSUFFICIENT_PRIVILEGE, message)
+    }
+}
+
+/// Identifies one of the plugin's masks. Its meaning is up to the plugin.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct MaskId(pub u64);
+
+/// A result column PgDog passes to [`crate::Plugin::mask_rows`].
+///
+/// The column must be `text`, `varchar` or `bpchar` in the rewritten statement
+/// (cast it if needed): for these types the text and binary formats are the
+/// same bytes, so masks never deal with formats. PgDog checks the type when it
+/// sees the statement's `RowDescription`, and fails the statement otherwise.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ColumnMask {
+    /// Which result set of the statement, counting from 0. Only simple queries
+    /// with several statements have more than one.
+    pub result: u16,
+    /// Column position in the result set, counting from 0.
+    pub column: u16,
+    /// Mask to apply.
+    pub mask: MaskId,
+    /// The mask may block, e.g. on a network call. PgDog runs batches with a
+    /// blocking mask on a thread pool for blocking work.
+    pub blocking: bool,
+}
+
+impl ColumnMask {
+    /// Mask a column of the first result set.
+    pub fn new(column: u16, mask: MaskId) -> Self {
+        Self {
+            result: 0,
+            column,
+            mask,
+            blocking: false,
+        }
+    }
+
+    /// Mask a column of a later result set of a multi-statement query.
+    pub fn in_result(mut self, result: u16) -> Self {
+        self.result = result;
         self
     }
 
-    /// Is the message code in the set?
-    pub const fn contains(&self, code: char) -> bool {
-        let code = code as u32;
-        code < 128 && self.0[(code / 64) as usize] & (1 << (code % 64)) != 0
-    }
-
-    /// Is the set empty?
-    pub const fn is_empty(&self) -> bool {
-        self.0[0] == 0 && self.0[1] == 0
+    /// The mask may block.
+    pub fn blocking(mut self) -> Self {
+        self.blocking = true;
+        self
     }
 }
 
-pub(crate) const ACTION_CONTINUE: u8 = 0;
-pub(crate) const ACTION_REWRITE: u8 = 1;
-pub(crate) const ACTION_BLOCK: u8 = 2;
-pub(crate) const ACTION_PANIC: u8 = 3;
+/// What PgDog should do with a statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Send the statement unchanged.
+    Allow,
+    /// Send `sql` instead, and mask `columns` of its results.
+    Rewrite {
+        /// Replacement SQL. May be the original SQL, to only mask columns.
+        sql: String,
+        /// Result columns to pass to [`crate::Plugin::mask_rows`]. Requires
+        /// [`crate::Capabilities::MASK`].
+        columns: Vec<ColumnMask>,
+    },
+    /// Return an error to the client.
+    Deny(Deny),
+}
 
-/// Output of [`crate::Plugin::statement`].
+impl Verdict {
+    /// Send `sql` instead, without masking any columns.
+    pub fn rewrite(sql: impl Into<String>) -> Self {
+        Self::Rewrite {
+            sql: sql.into(),
+            columns: vec![],
+        }
+    }
+}
+
+/// Whether a fast-path function call may run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Access {
+    /// Let it run.
+    Allow,
+    /// Return an error to the client.
+    Deny(Deny),
+}
+
+pub(crate) const VERDICT_ALLOW: u8 = 0;
+pub(crate) const VERDICT_REWRITE: u8 = 1;
+pub(crate) const VERDICT_DENY: u8 = 2;
+pub(crate) const VERDICT_PANIC: u8 = 3;
+
+/// [`Verdict`] or [`Access`] as it crosses the plugin boundary.
 ///
 /// Memory in this struct belongs to the plugin; PgDog copies it and returns it
 /// through the vtable to be freed by the plugin.
 #[repr(C)]
 #[derive(Debug)]
-pub struct StatementOutput {
+pub struct VerdictOutput {
     action: u8,
     sql: PdBuf,
-    variant_tag: u64,
-    sqlstate: [u8; 5],
+    columns: PdVec<ColumnMask>,
+    sqlstate: SqlState,
     message: PdBuf,
-    transform: u64,
-    transform_codes: MessageCodes,
 }
 
-impl StatementOutput {
-    /// Let the statement through unchanged.
-    pub fn cont() -> Self {
+impl VerdictOutput {
+    fn new(action: u8) -> Self {
         Self {
-            action: ACTION_CONTINUE,
+            action,
             sql: PdBuf::empty(),
-            variant_tag: 0,
-            sqlstate: [0; 5],
+            columns: PdVec::empty(),
+            sqlstate: SqlState::INTERNAL_ERROR,
             message: PdBuf::empty(),
-            transform: 0,
-            transform_codes: MessageCodes::none(),
         }
     }
 
-    /// Replace the statement's SQL.
-    ///
-    /// `variant_tag` identifies this rewrite. Return the same tag for the same
-    /// rewrite; a different tag on a later `Bind` makes PgDog re-prepare the
-    /// statement. Rewrites of a `Parse` or `Bind` must keep the number and types of
-    /// bind parameters unchanged.
-    pub fn rewrite(sql: impl Into<String>, variant_tag: u64) -> Self {
+    fn deny(deny: Deny) -> Self {
         Self {
-            action: ACTION_REWRITE,
-            sql: PdBuf::from(sql.into()),
-            variant_tag,
-            ..Self::cont()
+            sqlstate: deny.sqlstate,
+            message: PdBuf::from(deny.message),
+            ..Self::new(VERDICT_DENY)
         }
-    }
-
-    /// Reject the statement. The client receives an `ErrorResponse` with the given
-    /// SQLSTATE (5 ASCII characters, e.g. `"42501"`) and message.
-    pub fn block(sqlstate: &str, message: impl Into<String>) -> Self {
-        let mut code = *b"42501";
-        if sqlstate.len() == 5 && sqlstate.is_ascii() {
-            code.copy_from_slice(sqlstate.as_bytes());
-        }
-        Self {
-            action: ACTION_BLOCK,
-            sqlstate: code,
-            message: PdBuf::from(message.into()),
-            ..Self::cont()
-        }
-    }
-
-    /// Attach a result transform. PgDog will call [`crate::Plugin::transform`] with
-    /// `handle` for every server message of this statement whose code is in
-    /// `codes`, then [`crate::Plugin::release_transform`] when the statement is done.
-    ///
-    /// `handle` must not be zero.
-    pub fn with_transform(mut self, handle: u64, codes: MessageCodes) -> Self {
-        self.transform = handle;
-        self.transform_codes = codes;
-        self
     }
 
     pub(crate) fn panicked() -> Self {
-        Self {
-            action: ACTION_PANIC,
-            ..Self::cont()
-        }
+        Self::new(VERDICT_PANIC)
     }
 
     /// Release plugin-owned memory. Runs inside the plugin.
@@ -222,6 +243,7 @@ impl StatementOutput {
         // binary that allocated these buffers.
         unsafe {
             self.sql.free();
+            self.columns.free();
             self.message.free();
         }
     }
@@ -234,63 +256,39 @@ impl StatementOutput {
         &self.sql
     }
 
-    pub(crate) fn variant_tag(&self) -> u64 {
-        self.variant_tag
+    pub(crate) fn columns(&self) -> &[ColumnMask] {
+        self.columns.as_slice()
     }
 
-    pub(crate) fn sqlstate(&self) -> &[u8; 5] {
-        &self.sqlstate
-    }
-
-    pub(crate) fn message(&self) -> &PdBuf {
-        &self.message
-    }
-
-    pub(crate) fn transform(&self) -> Option<Transform> {
-        (self.transform != 0).then_some(Transform {
-            handle: self.transform,
-            codes: self.transform_codes,
-        })
+    pub(crate) fn denied(&self) -> Deny {
+        Deny {
+            sqlstate: self.sqlstate,
+            message: String::from_utf8_lossy(self.message.as_bytes()).into_owned(),
+        }
     }
 }
 
-/// A result transform attached to a statement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Transform {
-    /// Opaque handle created by the plugin.
-    pub handle: u64,
-    /// Server messages to pass to the plugin.
-    pub codes: MessageCodes,
+impl From<Verdict> for VerdictOutput {
+    fn from(verdict: Verdict) -> Self {
+        match verdict {
+            Verdict::Allow => Self::new(VERDICT_ALLOW),
+            Verdict::Rewrite { sql, columns } => Self {
+                sql: PdBuf::from(sql),
+                columns: PdVec::from(columns),
+                ..Self::new(VERDICT_REWRITE)
+            },
+            Verdict::Deny(deny) => Self::deny(deny),
+        }
+    }
 }
 
-/// What PgDog should do with a statement, as decoded from [`StatementOutput`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StatementAction {
-    /// Send the statement unchanged.
-    Continue,
-    /// Send `sql` instead.
-    Rewrite {
-        /// Replacement SQL.
-        sql: String,
-        /// Identifies the rewrite.
-        variant_tag: u64,
-    },
-    /// Return an error to the client.
-    Block {
-        /// SQLSTATE error code.
-        sqlstate: String,
-        /// Error message.
-        message: String,
-    },
-}
-
-/// Statement decision, owned by PgDog.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatementDecision {
-    /// What to do with the statement.
-    pub action: StatementAction,
-    /// Transform attached to the statement, if any.
-    pub transform: Option<Transform>,
+impl From<Access> for VerdictOutput {
+    fn from(access: Access) -> Self {
+        match access {
+            Access::Allow => Self::new(VERDICT_ALLOW),
+            Access::Deny(deny) => Self::deny(deny),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -298,27 +296,39 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_message_codes() {
-        let codes = MessageCodes::none().with('D').with('T').with('1');
-        assert!(codes.contains('D'));
-        assert!(codes.contains('T'));
-        assert!(codes.contains('1'));
-        assert!(!codes.contains('C'));
-        assert!(!codes.contains('é'));
-        assert!(MessageCodes::none().is_empty());
-        assert!(!codes.is_empty());
+    fn test_sqlstate() {
+        assert_eq!(
+            SqlState::new("42501"),
+            Some(SqlState::INSUFFICIENT_PRIVILEGE)
+        );
+        assert_eq!(SqlState::new("0A000").unwrap().as_str(), "0A000");
+        assert_eq!(SqlState::new("bad"), None);
+        assert_eq!(SqlState::new("4250a"), None);
+        assert_eq!(SqlState::new("425011"), None);
     }
 
     #[test]
-    fn test_block_sqlstate() {
-        let mut output = StatementOutput::block("XX000", "nope");
-        assert_eq!(output.sqlstate(), b"XX000");
-        assert_eq!(output.message().as_str(), Some("nope"));
+    fn test_verdict_output() {
+        let mut output = VerdictOutput::from(Verdict::Rewrite {
+            sql: "SELECT 1".into(),
+            columns: vec![ColumnMask::new(2, MaskId(7)).blocking()],
+        });
+        assert_eq!(output.action(), VERDICT_REWRITE);
+        assert_eq!(output.sql().as_str(), Some("SELECT 1"));
+        assert_eq!(
+            output.columns(),
+            &[ColumnMask {
+                result: 0,
+                column: 2,
+                mask: MaskId(7),
+                blocking: true,
+            }]
+        );
         output.free();
 
-        // Invalid codes fall back to insufficient_privilege.
-        let mut output = StatementOutput::block("bad", "nope");
-        assert_eq!(output.sqlstate(), b"42501");
+        let mut output = VerdictOutput::from(Access::Deny(Deny::insufficient_privilege("no")));
+        assert_eq!(output.action(), VERDICT_DENY);
+        assert_eq!(output.denied(), Deny::insufficient_privilege("no"));
         output.free();
     }
 }

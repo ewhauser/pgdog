@@ -10,7 +10,7 @@
 //! ```
 //! use pgdog_plugin::Capabilities;
 //!
-//! let caps = Capabilities::STATEMENT | Capabilities::TRANSFORM;
+//! let caps = Capabilities::STATEMENT | Capabilities::MASK;
 //! assert!(caps.contains(Capabilities::STATEMENT));
 //! assert!(!caps.contains(Capabilities::ROUTE));
 //! ```
@@ -26,17 +26,19 @@ impl Capabilities {
     pub const NONE: Self = Self(0);
     /// [`crate::Plugin::route`] is called for every routed statement.
     pub const ROUTE: Self = Self(1 << 0);
-    /// [`crate::Plugin::statement`] is called before PgDog parses a statement and can
-    /// rewrite or block it.
+    /// [`crate::Plugin::statement`] and [`crate::Plugin::function_call`] are
+    /// called before PgDog parses a statement, and can rewrite or deny it.
+    /// Only one loaded plugin can have this capability.
     pub const STATEMENT: Self = Self(1 << 1);
-    /// [`crate::Plugin::transform`] is called for server messages of statements
-    /// the plugin attached a transform to.
-    pub const TRANSFORM: Self = Self(1 << 2);
-    /// [`crate::Plugin::schema`] receives database schema snapshots. Forces PgDog
+    /// [`crate::Plugin::mask_rows`] is called for result columns the plugin's
+    /// statement verdicts asked to mask. Requires [`Self::STATEMENT`].
+    pub const MASK: Self = Self(1 << 2);
+    /// [`crate::Plugin::redact_error`] is called for every error and notice
+    /// Postgres sends to a client.
+    pub const ERRORS: Self = Self(1 << 3);
+    /// [`crate::Plugin::catalog`] receives the database catalog. Forces PgDog
     /// to load the schema even if `load_schema` would otherwise skip it.
-    pub const SCHEMA: Self = Self(1 << 3);
-    /// PgDog refuses to start if this plugin fails to load or configure.
-    pub const REQUIRED: Self = Self(1 << 4);
+    pub const CATALOG: Self = Self(1 << 4);
 
     /// Create capabilities from raw bits. Unknown bits are kept, so a newer
     /// plugin can't be misread by an older host.
@@ -75,9 +77,9 @@ mod test {
 
     #[test]
     fn test_contains() {
-        let caps = Capabilities::ROUTE | Capabilities::SCHEMA;
+        let caps = Capabilities::ROUTE | Capabilities::CATALOG;
         assert!(caps.contains(Capabilities::ROUTE));
-        assert!(caps.contains(Capabilities::ROUTE | Capabilities::SCHEMA));
+        assert!(caps.contains(Capabilities::ROUTE | Capabilities::CATALOG));
         assert!(!caps.contains(Capabilities::STATEMENT));
         assert!(caps.contains(Capabilities::NONE));
     }

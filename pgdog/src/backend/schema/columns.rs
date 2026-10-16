@@ -4,8 +4,9 @@ pub(crate) use pgdog_stats::ForeignKey;
 pub(crate) use pgdog_stats::ForeignKeyAction;
 use serde::{Deserialize, Serialize};
 
-use super::{CatalogDetail, Error, catalog::fetch_qualified};
+use super::{Error, catalog::fetch_qualified};
 use crate::{backend::Server, net::messages::DataRow};
+use pgdog_plugin::CatalogParts;
 use pgdog_stats::SecurityLabel;
 use std::{
     collections::HashMap,
@@ -77,16 +78,18 @@ impl DerefMut for Column {
 impl Column {
     /// Load all columns from server, including foreign key information.
     ///
-    /// The full catalog reads `pg_attribute`, which isn't filtered by privileges
-    /// like `information_schema` is, and adds type names, comments and security labels.
+    /// For plugins that ask for [`CatalogParts::COLUMNS`], this reads `pg_attribute`,
+    /// which isn't filtered by privileges like `information_schema` is, and adds
+    /// type names, comments and security labels.
     pub(crate) async fn load(
         server: &mut Server,
-        detail: CatalogDetail,
+        parts: CatalogParts,
     ) -> Result<HashMap<(String, String), Vec<Column>>, Error> {
         let mut result = HashMap::new();
-        let rows: Vec<Self> = match detail {
-            CatalogDetail::Standard => server.fetch_all(COLUMNS).await?,
-            CatalogDetail::Full => fetch_qualified(server, COLUMNS_CATALOG).await?,
+        let rows: Vec<Self> = if parts.contains(CatalogParts::COLUMNS) {
+            fetch_qualified(server, COLUMNS_CATALOG).await?
+        } else {
+            server.fetch_all(COLUMNS).await?
         };
 
         for row in rows {
@@ -151,8 +154,8 @@ mod test {
     use super::Error;
     use crate::backend::pool::Request;
     use crate::backend::pool::test::pool;
-    use crate::backend::schema::CatalogDetail;
     use crate::backend::schema::columns::Column;
+    use pgdog_plugin::CatalogParts;
 
     #[tokio::test]
     async fn test_load_partitioned_primary_keys() -> Result<(), Error> {
@@ -176,7 +179,7 @@ mod test {
         )
         .await?;
 
-        let columns = Column::load(&mut conn, CatalogDetail::Standard).await?;
+        let columns = Column::load(&mut conn, CatalogParts::NONE).await?;
         for table in ["parted", "parted_0", "parted_1"] {
             let table_columns = columns
                 .get(&("pk_partition_test".to_owned(), table.to_owned()))
@@ -200,9 +203,7 @@ mod test {
     async fn test_load_columns() {
         let pool = pool();
         let mut conn = pool.get(&Request::default()).await.unwrap();
-        let _columns = Column::load(&mut conn, CatalogDetail::Standard)
-            .await
-            .unwrap();
+        let _columns = Column::load(&mut conn, CatalogParts::NONE).await.unwrap();
     }
 
     #[tokio::test]
@@ -240,9 +241,7 @@ mod test {
         .await
         .unwrap();
 
-        let columns = Column::load(&mut conn, CatalogDetail::Standard)
-            .await
-            .unwrap();
+        let columns = Column::load(&mut conn, CatalogParts::NONE).await.unwrap();
 
         // Find the customer_id column in fk_test_orders (uses "pgdog" schema in test db)
         let orders_columns = columns
@@ -319,9 +318,7 @@ mod test {
         .await
         .unwrap();
 
-        let columns = Column::load(&mut conn, CatalogDetail::Standard)
-            .await
-            .unwrap();
+        let columns = Column::load(&mut conn, CatalogParts::NONE).await.unwrap();
 
         let child_columns = columns
             .get(&("pgdog".to_string(), "fk_comp_child".to_string()))

@@ -189,8 +189,30 @@ impl QueryEngine {
     pub(crate) async fn process_server_message(
         &mut self,
         context: &mut QueryEngineContext<'_>,
-        mut message: Message,
+        message: Message,
     ) -> Result<(), Error> {
+        let mut next = Some(message);
+        while let Some(message) = next.take() {
+            next = self.process_one_server_message(context, message).await?;
+        }
+        Ok(())
+    }
+
+    /// Bookkeeping for a `DataRow` from Postgres.
+    pub(super) fn data_row_received(&mut self, message: &Message) {
+        // N.B. Call this before self.cleanup_backend(), since `cleanup_backend()` resets
+        // the router and the command state.
+        self.handle_advisory_locks(message);
+        self.result_row_counter += 1;
+    }
+
+    /// Handle one message received from Postgres. Returns a message read ahead
+    /// while handling it, which must be handled next.
+    async fn process_one_server_message(
+        &mut self,
+        context: &mut QueryEngineContext<'_>,
+        mut message: Message,
+    ) -> Result<Option<Message>, Error> {
         self.streaming = message.streaming();
         let code = message.code();
 
@@ -205,12 +227,7 @@ impl QueryEngine {
                 }
             }
 
-            'D' => {
-                // N.B. Call this before self.cleanup_backend(), since `cleanup_backend()` resets
-                // the router and the command state.
-                self.handle_advisory_locks(&message);
-                self.result_row_counter += 1;
-            }
+            'D' => self.data_row_received(&message),
 
             'C' => {
                 self.backend
@@ -314,8 +331,12 @@ impl QueryEngine {
             && !context.pipeline.is_done()
             && context.pipeline.is_simple()
             && !context.in_error());
-        self.transform_server_message(context, &mut message, client_visible)
-            .await?;
+        if let Some(masking) = self
+            .plugin_server_message(context, &mut message, client_visible)
+            .await?
+        {
+            return self.mask_data_rows(context, message, masking).await;
+        }
 
         // Messages that we need to send to the client immediately.
         // ReadyForQuery (B) | CopyInResponse (B) | ErrorResponse(B) | NoticeResponse(B) | NotificationResponse (B)
@@ -347,7 +368,7 @@ impl QueryEngine {
 
         self.hooks.on_server_message(context, &message)?;
 
-        Ok(())
+        Ok(None)
     }
 
     async fn emit_explain_rows(

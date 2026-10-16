@@ -1,8 +1,8 @@
 //! Commonly used structs and re-exports.
 
 pub use crate::{
-    Capabilities, Context, Identity, MessageCodes, ParameterFormat, PdStr, Plugin, ReadWrite,
-    Route, Shard, StatementContext, StatementKind, StatementOutput, TransformContext,
-    TransformOutput,
+    Access, Capabilities, Catalog, CatalogParts, ColumnMask, Context, Deny, ErrorFields, MaskBatch,
+    MaskError, MaskId, MaskOutput, ParameterFormat, PdStr, Plugin, ReadWrite, Redaction, Route,
+    Session, Shard, SqlState, Verdict,
     parameters::{Parameter, ParameterValue, Parameters},
 };

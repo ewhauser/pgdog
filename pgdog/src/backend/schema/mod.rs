@@ -20,31 +20,10 @@ use super::{Cluster, Error, Server, pool::Request};
 use crate::frontend::router::parser::Table;
 use crate::net::parameter::ParameterValue;
 use crate::plugin;
-use pgdog_plugin::Capabilities;
+use pgdog_plugin::CatalogParts;
 use sync::ShardConfig;
 
 static SETUP: &str = include_str!("setup.sql");
-
-/// How much of the catalog to load.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CatalogDetail {
-    /// What PgDog itself needs: relations and the columns the loading role can see.
-    Standard,
-    /// Everything plugins may need: columns from `pg_attribute`, view definitions,
-    /// comments, security labels, functions and operators.
-    Full,
-}
-
-impl CatalogDetail {
-    /// The full catalog is loaded only for plugins that receive schema snapshots.
-    pub(crate) fn current() -> Self {
-        if plugin::has_capability(Capabilities::SCHEMA) {
-            Self::Full
-        } else {
-            Self::Standard
-        }
-    }
-}
 
 /// Load schema from database.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Hash)]
@@ -69,16 +48,13 @@ impl DerefMut for Schema {
 impl Schema {
     /// Load schema from a server connection.
     pub(crate) async fn load(server: &mut Server) -> Result<Self, Error> {
-        Self::load_with(server, CatalogDetail::current()).await
+        Self::load_with(server, plugin::catalog_parts()).await
     }
 
-    /// Load schema from a server connection, with the given catalog detail.
-    pub(crate) async fn load_with(
-        server: &mut Server,
-        detail: CatalogDetail,
-    ) -> Result<Self, Error> {
+    /// Load schema from a server connection, with the catalog parts plugins need.
+    pub(crate) async fn load_with(server: &mut Server, parts: CatalogParts) -> Result<Self, Error> {
         let mut relations: StatsRelations = HashMap::new();
-        for relation in Relation::load(server, detail).await? {
+        for relation in Relation::load(server, parts).await? {
             relations
                 .entry(relation.schema().to_owned())
                 .or_default()
@@ -102,20 +78,24 @@ impl Schema {
             .into_iter()
             .collect();
 
-        let (functions, operators, system_functions) = match detail {
-            CatalogDetail::Standard => (Vec::new(), Vec::new(), Vec::new()),
-            CatalogDetail::Full => (
+        let (functions, system_functions) = if parts.contains(CatalogParts::FUNCTIONS) {
+            (
                 catalog::functions(server).await?,
-                catalog::operators(server).await?,
                 catalog::system_functions(server).await?,
-            ),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let operators = if parts.contains(CatalogParts::OPERATORS) {
+            catalog::operators(server).await?
+        } else {
+            Vec::new()
         };
 
         let inner = SchemaInner {
             search_path,
             relations,
             aggregate_functions,
-            full_catalog: detail == CatalogDetail::Full,
             functions,
             operators,
             system_functions,
@@ -305,7 +285,7 @@ mod test {
     use crate::net::parameter::ParameterValue;
 
     use super::super::pool::test::pool;
-    use super::Schema;
+    use super::{CatalogParts, Schema};
     use pgdog_stats::SecurityLabel;
 
     #[tokio::test]
@@ -642,8 +622,6 @@ mod test {
 
     #[tokio::test]
     async fn test_load_full_catalog() {
-        use super::CatalogDetail;
-
         let mut server = test_server().await;
         server.execute_checked("BEGIN").await.unwrap();
         server
@@ -675,19 +653,17 @@ mod test {
             .await
             .unwrap();
 
-        let standard = Schema::load_with(&mut server, CatalogDetail::Standard)
+        let standard = Schema::load_with(&mut server, CatalogParts::NONE)
             .await
             .unwrap();
-        assert!(!standard.full_catalog);
         assert!(standard.functions.is_empty());
         let people = standard.get("catalog_test", "people").unwrap();
         assert!(people.definition.is_none());
         assert_eq!(people.columns["ssn"].comment, None);
 
-        let full = Schema::load_with(&mut server, CatalogDetail::Full)
+        let full = Schema::load_with(&mut server, CatalogParts::ALL)
             .await
             .unwrap();
-        assert!(full.full_catalog);
 
         let people = full.get("catalog_test", "people").unwrap();
         let columns: Vec<_> = people.column_names().collect();
@@ -775,7 +751,7 @@ mod test {
             .execute_checked("SET LOCAL ROLE catalog_test_reader")
             .await
             .unwrap();
-        let standard = Schema::load_with(&mut server, CatalogDetail::Standard)
+        let standard = Schema::load_with(&mut server, CatalogParts::NONE)
             .await
             .unwrap();
         let visible: Vec<_> = standard
@@ -784,7 +760,7 @@ mod test {
             .column_names()
             .collect();
         assert_eq!(visible, ["id"]);
-        let full = Schema::load_with(&mut server, CatalogDetail::Full)
+        let full = Schema::load_with(&mut server, CatalogParts::ALL)
             .await
             .unwrap();
         let visible: Vec<_> = full
@@ -806,17 +782,15 @@ mod test {
 
     #[tokio::test]
     async fn test_load_full_catalog_outside_transaction() {
-        use super::CatalogDetail;
-
         let mut server = test_server().await;
         let before = server
             .fetch_all::<String>("SHOW search_path")
             .await
             .unwrap();
-        let schema = Schema::load_with(&mut server, CatalogDetail::Full)
+        let schema = Schema::load_with(&mut server, CatalogParts::ALL)
             .await
             .unwrap();
-        assert!(schema.full_catalog);
+        assert!(!schema.system_functions.is_empty());
         assert!(!server.in_transaction());
         let after = server
             .fetch_all::<String>("SHOW search_path")

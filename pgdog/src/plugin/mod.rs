@@ -1,11 +1,13 @@
 //! pgDog plugins.
 
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
+use parking_lot::Mutex;
 use pgdog_config::{Config, LogFormat, Plugin as PluginConfig};
 use pgdog_plugin::libloading::Library;
-use pgdog_plugin::{Capabilities, Config as PdConfig, PdStr, PluginVtable};
+use pgdog_plugin::{Capabilities, CatalogParts, Config as PdConfig, PdStr, PluginVtable};
 use semver::Version;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use thiserror::Error;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -14,7 +16,8 @@ use crate::backend::Schema;
 
 static LIBS: OnceCell<Vec<Option<Library>>> = OnceCell::new();
 static PLUGINS: OnceCell<Plugins> = OnceCell::new();
-static SCHEMA_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Hash of the last catalog sent to plugins, by database.
+static CATALOGS: Lazy<Mutex<HashMap<String, u64>>> = Lazy::new(Default::default);
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
@@ -50,6 +53,8 @@ struct Plugins {
     list: Vec<LoadedPlugin>,
     /// Union of all plugins' capabilities.
     capabilities: Capabilities,
+    /// Union of the catalog parts plugins asked for.
+    catalog_parts: CatalogParts,
 }
 
 // Compare semantic versions by major and minor only (ignore patch/bugfix).
@@ -97,9 +102,12 @@ pub(crate) fn load(config: &Config) -> Result<(), Error> {
     let mut required_failure = None;
 
     for (plugin, lib) in plugins.iter().zip(LIBS.get().into_iter().flatten()) {
-        match load_one(config, plugin, lib.as_ref()) {
+        match load_one(config, plugin, lib.as_ref(), &loaded) {
             Ok(plugin) => {
                 loaded.capabilities |= plugin.capabilities;
+                if plugin.has(Capabilities::CATALOG) {
+                    loaded.catalog_parts |= plugin.vtable.catalog_parts();
+                }
                 loaded.list.push(plugin);
             }
             Err(failure) => {
@@ -126,44 +134,48 @@ fn load_one(
     config: &Config,
     plugin: &PluginConfig,
     lib: Option<&'static Library>,
+    loaded: &Plugins,
 ) -> Result<LoadedPlugin, LoadFailure> {
-    let fail = |reason: String, required: bool| LoadFailure {
+    let fail = |reason: String| LoadFailure {
         reason,
-        required: plugin.required || required,
+        required: plugin.required,
     };
 
     let now = Instant::now();
-    let lib = lib.ok_or_else(|| fail("shared library could not be opened".into(), false))?;
-    let plugin_lib = PluginVtable::load(lib)
-        .ok_or_else(|| fail("its vtable could not be loaded".into(), false))?;
+    let lib = lib.ok_or_else(|| fail("shared library could not be opened".into()))?;
+    let plugin_lib =
+        PluginVtable::load(lib).ok_or_else(|| fail("its vtable could not be loaded".into()))?;
 
     // Check plugin api version (compare major.minor only)
     let plugin_api_version = plugin_lib.pgdog_plugin_api_version();
     if !same_major_minor(&plugin_api_version, pgdog_plugin::VERSION) {
-        return Err(fail(
-            format!(
-                "it was compiled with a different plugin API version ({})",
-                &*plugin_api_version
-            ),
-            false,
-        ));
+        return Err(fail(format!(
+            "it was compiled with a different plugin API version ({})",
+            &*plugin_api_version
+        )));
     }
 
     // Check Rust compiler version.
     let plugin_rustc_version = plugin_lib.rustc_version();
     if pgdog_plugin::RUSTC_VERSION != &*plugin_rustc_version {
-        return Err(fail(
-            format!(
-                "it was compiled with a different compiler version ({})",
-                &*plugin_rustc_version
-            ),
-            false,
-        ));
+        return Err(fail(format!(
+            "it was compiled with a different compiler version ({})",
+            &*plugin_rustc_version
+        )));
     }
 
     // Safe to read past the version fields now that versions match.
     let capabilities = plugin_lib.capabilities();
-    let required = capabilities.contains(Capabilities::REQUIRED);
+
+    // Verdicts of several plugins can't be combined: a rewrite changes the
+    // columns another plugin's masks refer to.
+    if capabilities.contains(Capabilities::STATEMENT)
+        && loaded.capabilities.contains(Capabilities::STATEMENT)
+    {
+        return Err(fail(
+            "another plugin already implements the statement hook".into(),
+        ));
+    }
 
     let plugin_config_path = plugin
         .config
@@ -186,7 +198,7 @@ fn load_one(
     debug!("plugin \"{}\" initialized", plugin.name);
 
     if !plugin_lib.config(pd_config) {
-        return Err(fail("it failed to load its configuration".into(), required));
+        return Err(fail("it failed to load its configuration".into()));
     }
 
     info!(
@@ -234,43 +246,36 @@ pub(crate) fn has_capability(capability: Capabilities) -> bool {
         .is_some_and(|plugins| plugins.capabilities.contains(capability))
 }
 
-/// Send a freshly loaded schema to plugins that asked for it.
+/// Catalog parts loaded plugins asked for.
+pub(crate) fn catalog_parts() -> CatalogParts {
+    PLUGINS
+        .get()
+        .map(|plugins| plugins.catalog_parts)
+        .unwrap_or_default()
+}
+
+/// Send a freshly loaded schema to plugins that asked for the catalog,
+/// unless it's the same as the last one sent for this database.
 pub(crate) fn schema_loaded(database: &str, schema: &Schema) {
-    if !has_capability(Capabilities::SCHEMA) {
+    if !has_capability(Capabilities::CATALOG) {
         return;
     }
 
-    let snapshot = match snapshot(schema) {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            error!("failed to serialize schema for plugins: {err}");
-            return;
-        }
-    };
-    let epoch = SCHEMA_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut hasher = DefaultHasher::new();
+    schema.hash(&mut hasher);
+    let hash = hasher.finish();
+    if CATALOGS.lock().insert(database.to_owned(), hash) == Some(hash) {
+        return;
+    }
 
-    for plugin in with_capability(Capabilities::SCHEMA) {
-        plugin.vtable.schema(database, epoch, &snapshot);
+    let catalog = catalog::from_schema(schema, catalog_parts());
+    for plugin in with_capability(Capabilities::CATALOG) {
+        plugin.vtable.catalog(database, &catalog);
         debug!(
-            "sent schema for \"{}\" to plugin \"{}\" [epoch: {}]",
-            database, plugin.name, epoch
+            "sent catalog of \"{}\" to plugin \"{}\"",
+            database, plugin.name
         );
     }
-}
-
-/// A schema snapshot as sent to plugins: the schema, versioned.
-fn snapshot(schema: &pgdog_stats::Schema) -> Result<String, serde_json::Error> {
-    #[derive(serde::Serialize)]
-    struct Snapshot<'a> {
-        format_version: u32,
-        #[serde(flatten)]
-        schema: &'a pgdog_stats::Schema,
-    }
-
-    serde_json::to_string(&Snapshot {
-        format_version: pgdog_plugin::SCHEMA_SNAPSHOT_VERSION,
-        schema,
-    })
 }
 
 /// Ask plugins to reload their configuration.
@@ -292,19 +297,6 @@ pub(crate) fn load_from_config() -> Result<(), Error> {
     load(&config.config)
 }
 
+mod catalog;
 #[cfg(test)]
 pub(crate) mod test;
-
-#[cfg(test)]
-mod snapshot_test {
-    #[test]
-    fn test_snapshot_is_versioned() {
-        let snapshot = super::snapshot(&pgdog_stats::Schema::default()).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
-        assert_eq!(
-            value["format_version"],
-            pgdog_plugin::SCHEMA_SNAPSHOT_VERSION
-        );
-        assert!(value["inner"].is_object(), "{snapshot}");
-    }
-}
