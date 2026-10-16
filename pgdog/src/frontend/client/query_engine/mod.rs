@@ -256,18 +256,27 @@ impl QueryEngine {
                 .await?
             }
             Command::CommitTransaction { extended, .. } => {
+                // Like Postgres, COMMIT of a failed transaction rolls it back.
+                let rollback = context.in_error();
+
                 if self.backend.connected() {
                     // Transaction control statements should be excluded from cross-shard checks.
                     context.cross_shard_disabled = Some(false);
                     self.end_connected(context, client_request, false, *extended)
                         .await?;
                 } else {
-                    self.end_not_connected(context, client_request, false, *extended)
+                    // The transaction can fail before it has a server connection,
+                    // e.g., when a plugin blocks its first statement.
+                    self.end_not_connected(context, client_request, rollback, *extended)
                         .await?
                 }
 
-                if client_request.is_executable() && context.params.commit() {
-                    self.comms.update_params(context.params);
+                if client_request.is_executable() {
+                    if rollback {
+                        context.params.rollback();
+                    } else if context.params.commit() {
+                        self.comms.update_params(context.params);
+                    }
                 }
             }
             Command::RollbackTransaction { extended, .. } => {

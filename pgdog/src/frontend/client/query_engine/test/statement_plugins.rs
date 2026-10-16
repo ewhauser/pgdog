@@ -495,3 +495,49 @@ async fn test_close_releases_statement_transforms() {
     client.read_until('Z').await.unwrap();
     assert_eq!(RELEASED.load(Ordering::Relaxed), released + 1);
 }
+
+/// PgDog connects lazily, so a block of the first statement after BEGIN fails
+/// the transaction before it has a server connection. COMMIT still rolls back.
+#[tokio::test]
+async fn test_block_first_statement_then_commit() {
+    let mut client = test_client().await;
+    client.send_simple(Query::new("BEGIN")).await;
+    client.read_until('Z').await.unwrap();
+
+    client
+        .send_simple(Query::new(format!("SELECT '{BLOCK}'")))
+        .await;
+    client.read_until('Z').await.unwrap_err();
+    let ready = expect_message!(client.read().await, ReadyForQuery);
+    assert_eq!(ready.status, 'E');
+    assert!(!client.backend_connected(), "blocked query never connects");
+
+    client.send_simple(Query::new("COMMIT")).await;
+    let messages = client.read_until('Z').await.unwrap();
+    let complete = messages.iter().find(|m| m.code() == 'C').unwrap();
+    let complete = crate::net::CommandComplete::try_from(complete.clone()).unwrap();
+    assert_eq!(complete.command(), "ROLLBACK");
+    let ready = ReadyForQuery::try_from(messages.last().unwrap().clone()).unwrap();
+    assert_eq!(ready.status, 'I');
+
+    // Same for the extended protocol.
+    client.send_simple(Query::new("BEGIN")).await;
+    client.read_until('Z').await.unwrap();
+    client
+        .send_simple(Query::new(format!("SELECT '{BLOCK}'")))
+        .await;
+    client.read_until('Z').await.unwrap_err();
+    expect_message!(client.read().await, ReadyForQuery);
+
+    client.send(Parse::new_anonymous("COMMIT")).await;
+    client.send(Bind::new_statement("")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let messages = client.read_until('Z').await.unwrap();
+    let complete = messages.iter().find(|m| m.code() == 'C').unwrap();
+    let complete = crate::net::CommandComplete::try_from(complete.clone()).unwrap();
+    assert_eq!(complete.command(), "ROLLBACK");
+    let ready = ReadyForQuery::try_from(messages.last().unwrap().clone()).unwrap();
+    assert_eq!(ready.status, 'I');
+}
