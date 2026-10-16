@@ -241,6 +241,15 @@ impl QueryParser {
                 }
             }
 
+            // Column comments and security labels are part of the schema plugins
+            // receive: plugins can tag columns with them.
+            Node::CommentStmt(stmt) if stmt.objtype == ObjectType::OBJECT_COLUMN => {
+                schema_changed = true;
+            }
+            Node::SecLabelStmt(stmt) if stmt.objtype == ObjectType::OBJECT_COLUMN => {
+                schema_changed = true;
+            }
+
             // All others are not handled.
             // They are sent to all shards concurrently.
             _ => (),

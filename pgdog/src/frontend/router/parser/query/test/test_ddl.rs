@@ -376,3 +376,25 @@ fn test_analyze_shard_1() {
     assert!(command.route().is_write());
     assert_eq!(command.route().shard(), &Shard::Direct(1));
 }
+
+#[test]
+fn test_column_metadata_changes_schema() {
+    let mut test = QueryParserTest::new();
+
+    for (sql, changed) in [
+        (
+            "COMMENT ON COLUMN sharded.email IS 'pgdog:tag=pii.email'",
+            true,
+        ),
+        (
+            "SECURITY LABEL FOR pgdog ON COLUMN sharded.email IS 'pii.email'",
+            true,
+        ),
+        // Only column metadata reaches plugins.
+        ("COMMENT ON TABLE sharded IS 'customers'", false),
+    ] {
+        let command = test.execute(vec![Query::new(sql).into()]);
+        assert!(command.route().is_write(), "{sql}");
+        assert_eq!(command.route().is_schema_changed(), changed, "{sql}");
+    }
+}
