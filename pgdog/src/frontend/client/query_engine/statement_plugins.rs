@@ -28,6 +28,7 @@
 //!
 //! Server messages are attributed to their owner by keeping, in order, the client
 //! messages that are still waiting for responses.
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -40,7 +41,7 @@ use tracing::{debug, error, warn};
 
 use super::*;
 use crate::net::{Format, Parse, Protocol, ProtocolMessage, ReadyForQuery};
-use crate::parameters::ParameterValue;
+use crate::parameters::ParameterStore;
 use crate::plugin::{LoadedPlugin, has_capability, with_capability};
 
 /// A client's prepared statement, as the client prepared it.
@@ -68,6 +69,43 @@ struct Attachment {
     result_formats: Vec<i16>,
 }
 
+impl Attachment {
+    /// Pass a server message through the transforms. Returns the name of
+    /// the plugin that failed to transform it, if any.
+    fn transform(&self, code: char, message: &mut Message) -> Option<&'static str> {
+        for transform in &self.transforms {
+            if !transform.transform.codes.contains(code) {
+                continue;
+            }
+
+            let action = {
+                let payload = message.payload();
+                transform.plugin.vtable().transform(&TransformContext {
+                    handle: transform.transform.handle,
+                    code: code as u8,
+                    // Skip the code and length header.
+                    payload: PdSlice::from(&payload[5..]),
+                    result_formats: PdSlice::from(self.result_formats.as_slice()),
+                })
+            };
+
+            match action {
+                Ok(TransformAction::Forward) => (),
+                Ok(TransformAction::Replace(body)) => {
+                    let mut payload = BytesMut::with_capacity(body.len() + 5);
+                    payload.put_u8(code as u8);
+                    payload.put_i32(body.len() as i32 + 4);
+                    payload.put_slice(&body);
+                    message.replace_payload(payload.freeze());
+                }
+                Ok(TransformAction::Fail) | Err(_) => return Some(transform.plugin.name()),
+            }
+        }
+
+        None
+    }
+}
+
 impl Drop for Attachment {
     fn drop(&mut self) {
         for transform in self.transforms.drain(..) {
@@ -77,15 +115,6 @@ impl Drop for Attachment {
                 .release_transform(transform.transform.handle);
         }
     }
-}
-
-/// Which attachment a server message belongs to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Owner {
-    Query,
-    Statement(String),
-    Portal(String),
-    Nothing,
 }
 
 /// A client message still waiting for its responses.
@@ -102,15 +131,46 @@ enum Pending {
     Sync,
 }
 
+/// What to do with the head of the pending queue for a server message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Response {
+    /// The message is part of the response; more is coming.
+    Partial,
+    /// The message completes the response.
+    Complete,
+    /// The message is an error: the response is complete, and so are the
+    /// rest of the extended protocol messages until `Sync`.
+    Error,
+    /// The message isn't a response to it: the response came from PgDog.
+    Unrelated,
+}
+
 impl Pending {
-    fn owner(&self) -> Owner {
-        match self {
-            Self::Query => Owner::Query,
-            Self::Parse(name) | Self::DescribeStatement(name) => Owner::Statement(name.clone()),
-            Self::Bind(name) | Self::DescribePortal(name) | Self::Execute(name) => {
-                Owner::Portal(name.clone())
-            }
-            Self::Close | Self::Sync => Owner::Nothing,
+    fn response(&self, code: char, client_visible: bool) -> Response {
+        use Response::*;
+
+        match (self, code) {
+            // Internally split queries send ReadyForQuery for each part;
+            // only the one the client sees ends the query.
+            (Self::Query, 'Z') if client_visible => Complete,
+            (Self::Query, _) => Partial,
+            (Self::Parse(_), '1') => Complete,
+            (Self::Bind(_), '2') => Complete,
+            (Self::DescribeStatement(_), 't') => Partial,
+            (Self::DescribeStatement(_), 'T' | 'n') => Complete,
+            (Self::DescribePortal(_), 'T' | 'n') => Complete,
+            (Self::Execute(_), 'C' | 's' | 'I') => Complete,
+            (Self::Execute(_), '1' | '2' | '3' | 't' | 'Z') => Unrelated,
+            (Self::Execute(_), _) => Partial,
+            (Self::Close, '3') => Complete,
+            (Self::Sync, 'Z') => Complete,
+            // Errors belong to the message that failed. Postgres then skips the
+            // rest of the extended protocol messages until Sync.
+            (Self::Sync, 'E') => Partial,
+            (_, 'E') => Error,
+            // Notices and parameter changes belong to whatever is running.
+            (_, 'N' | 'S' | 'A') => Partial,
+            _ => Unrelated,
         }
     }
 }
@@ -137,10 +197,39 @@ pub(super) struct AuthenticatedIdentity {
     pub(super) database: String,
 }
 
+/// Who the client is, as plugins see it. None of it changes during the
+/// connection, so it's built once, the first time a plugin needs it.
+#[derive(Debug)]
+struct ClientIdentity {
+    user: String,
+    database: String,
+    client_addr: String,
+    tls_identity: String,
+    session_id: u64,
+}
+
+impl ClientIdentity {
+    fn new(identity: &AuthenticatedIdentity, context: &QueryEngineContext<'_>) -> Self {
+        Self {
+            user: identity.user.clone(),
+            database: identity.database.clone(),
+            client_addr: context
+                .stream
+                .peer_addr()
+                .map(|addr| addr.ip().to_string())
+                .unwrap_or_default(),
+            tls_identity: context.stream.tls_identity().unwrap_or_default().to_owned(),
+            session_id: context.id.pid() as u64,
+        }
+    }
+}
+
 /// Plugin state kept for the lifetime of the client connection.
 #[derive(Debug, Default)]
 pub(super) struct StatementPlugins {
     identity: AuthenticatedIdentity,
+    /// Built from `identity` and the connection on first use.
+    client: Option<ClientIdentity>,
     /// Prepared statements by client statement name ("" is the unnamed statement).
     sources: HashMap<String, StatementSource>,
     /// Transforms of the simple query being executed.
@@ -164,73 +253,49 @@ impl StatementPlugins {
         }
     }
 
-    fn attachment(&self, owner: &Owner) -> Option<&Attachment> {
-        match owner {
-            Owner::Query => self.query.as_ref(),
-            Owner::Statement(name) => self.statements.get(name),
-            Owner::Portal(name) => self.portals.get(name),
-            Owner::Nothing => None,
+    fn attachment(&self, pending: &Pending) -> Option<&Attachment> {
+        match pending {
+            Pending::Query => self.query.as_ref(),
+            Pending::Parse(name) | Pending::DescribeStatement(name) => self.statements.get(name),
+            Pending::Bind(name) | Pending::DescribePortal(name) | Pending::Execute(name) => {
+                self.portals.get(name)
+            }
+            Pending::Close | Pending::Sync => None,
         }
     }
 
-    fn has_transforms(&self) -> bool {
-        let any = |attachment: &Attachment| !attachment.transforms.is_empty();
-        self.query.as_ref().is_some_and(any)
-            || self.statements.values().any(any)
-            || self.portals.values().any(any)
-    }
-
     /// The attachment a server message belongs to. Consumes the pending client
-    /// message the server message completes.
-    fn owner(&mut self, code: char, client_visible: bool) -> Owner {
+    /// message the server message completes. Nothing pending, nothing to look up.
+    fn owner(&mut self, code: char, client_visible: bool) -> Option<&Attachment> {
         loop {
-            let Some(head) = self.pending.front() else {
-                return Owner::Nothing;
-            };
-            let owner = head.owner();
-            let (matches, done) =
-                match (head, code) {
-                    // Internally split queries send ReadyForQuery for each part;
-                    // only the one the client sees ends the query.
-                    (Pending::Query, 'Z') => (true, client_visible),
-                    (Pending::Query, _) => (true, false),
-                    (Pending::Parse(_), '1') => (true, true),
-                    (Pending::Bind(_), '2') => (true, true),
-                    (Pending::DescribeStatement(_), 't') => (true, false),
-                    (Pending::DescribeStatement(_), 'T' | 'n') => (true, true),
-                    (Pending::DescribePortal(_), 'T' | 'n') => (true, true),
-                    (Pending::Execute(_), 'C' | 's' | 'I') => (true, true),
-                    (Pending::Execute(_), code) => {
-                        (!matches!(code, '1' | '2' | '3' | 't' | 'Z'), false)
+            let response = self.pending.front()?.response(code, client_visible);
+            match response {
+                Response::Partial => return self.attachment(self.pending.front()?),
+                Response::Complete => {
+                    let head = self.pending.pop_front()?;
+                    return self.attachment(&head);
+                }
+                Response::Error => {
+                    let head = self.pending.pop_front()?;
+                    while self
+                        .pending
+                        .front()
+                        .is_some_and(|pending| !matches!(pending, Pending::Sync | Pending::Query))
+                    {
+                        self.pending.pop_front();
                     }
-                    (Pending::Close, '3') => (true, true),
-                    (Pending::Sync, 'Z') => (true, true),
-                    // Errors belong to the message that failed. Postgres then skips the
-                    // rest of the extended protocol messages until Sync.
-                    (_, 'E') => {
-                        while self.pending.front().is_some_and(|pending| {
-                            !matches!(pending, Pending::Sync | Pending::Query)
-                        }) {
-                            self.pending.pop_front();
-                        }
-                        return owner;
-                    }
-                    // Notices and parameter changes belong to whatever is running.
-                    (_, 'N' | 'S' | 'A') => (true, false),
-                    _ => (false, false),
-                };
-
-            if matches {
-                if done {
+                    return self.attachment(&head);
+                }
+                Response::Unrelated => {
+                    // The response to this message was produced by PgDog itself, not
+                    // the server, so it never reaches us. Move on to the next one.
+                    debug!(
+                        "statement plugins: no response for {:?} before '{code}'",
+                        self.pending.front()
+                    );
                     self.pending.pop_front();
                 }
-                return owner;
             }
-
-            // The response to this message was produced by PgDog itself, not
-            // the server, so it never reaches us. Move on to the next one.
-            debug!("statement plugins: no response for {head:?} before '{code}'");
-            self.pending.pop_front();
         }
     }
 
@@ -294,61 +359,52 @@ impl Staged {
 }
 
 /// Session information plugins receive with every statement.
-struct Session {
-    user: String,
-    database: String,
-    application_name: String,
-    client_addr: String,
-    tls_identity: String,
-    search_path: String,
-    session_id: u64,
+struct Session<'a> {
+    client: &'a ClientIdentity,
+    application_name: Cow<'a, str>,
+    search_path: Cow<'a, str>,
     in_transaction: bool,
 }
 
-impl Session {
-    fn new(context: &QueryEngineContext<'_>, identity: &AuthenticatedIdentity) -> Self {
+impl<'a> Session<'a> {
+    fn new(client: &'a ClientIdentity, params: &'a ParameterStore, in_transaction: bool) -> Self {
         // Display quotes values for use in SQL; plugins get them as-is.
-        let value = |value: &ParameterValue| match value.as_str() {
-            Some(value) => value.to_owned(),
-            None => value.to_string(),
+        let param = |name: &str| match params.get(name) {
+            Some(value) => match value.as_str() {
+                Some(value) => Cow::Borrowed(value),
+                None => Cow::Owned(value.to_string()),
+            },
+            None => Cow::Borrowed(""),
         };
-        let param = |name: &str| context.params.get(name).map(value).unwrap_or_default();
 
         Self {
-            user: identity.user.clone(),
-            database: identity.database.clone(),
+            client,
             application_name: param("application_name"),
             search_path: param("search_path"),
-            client_addr: context
-                .stream
-                .peer_addr()
-                .map(|addr| addr.ip().to_string())
-                .unwrap_or_default(),
-            tls_identity: context.stream.tls_identity().unwrap_or_default().to_owned(),
-            session_id: context.id.pid() as u64,
-            in_transaction: context.in_transaction(),
+            in_transaction,
         }
     }
 
-    fn context<'a>(
-        &'a self,
+    fn context<'b>(
+        &'b self,
         kind: StatementKind,
-        sql: &'a str,
-        statement_name: &'a str,
-    ) -> StatementContext<'a> {
+        sql: &'b str,
+        statement_name: &'b str,
+    ) -> StatementContext<'b> {
+        let client = self.client;
         StatementContext {
             identity: Identity {
-                user: self.user.as_str().into(),
-                database: self.database.as_str().into(),
-                application_name: self.application_name.as_str().into(),
-                client_addr: self.client_addr.as_str().into(),
-                tls_identity: self.tls_identity.as_str().into(),
-                session_id: self.session_id,
+                user: client.user.as_str().into(),
+                database: client.database.as_str().into(),
+                application_name: self.application_name.as_ref().into(),
+                client_addr: client.client_addr.as_str().into(),
+                tls_identity: client.tls_identity.as_str().into(),
+                session_id: client.session_id,
             },
             kind,
             sql: sql.into(),
             statement_name: statement_name.into(),
-            search_path: self.search_path.as_str().into(),
+            search_path: self.search_path.as_ref().into(),
             in_transaction: self.in_transaction,
         }
     }
@@ -477,8 +533,11 @@ impl QueryEngine {
             self.statement_plugins.query = None;
         }
 
-        let session = Session::new(context, &self.statement_plugins.identity);
         let state = &mut self.statement_plugins;
+        let client = state
+            .client
+            .get_or_insert_with(|| ClientIdentity::new(&state.identity, context));
+        let session = Session::new(client, context.params, context.in_transaction());
         let mut staged = Staged::default();
         let mut unnamed: Option<Parse> = None;
 
@@ -705,74 +764,33 @@ impl QueryEngine {
         }
 
         let code = message.code();
-        let tracking = !self.statement_plugins.pending.is_empty();
-        if !tracking && !self.statement_plugins.has_transforms() {
-            return Ok(());
-        }
-
-        let owner = self.statement_plugins.owner(code, client_visible);
-        let (transforms, result_formats) = self
+        // Borrows the transforms: this runs for every message, DataRows included.
+        let failed = self
             .statement_plugins
-            .attachment(&owner)
-            .map(|attachment| {
-                (
-                    attachment.transforms.clone(),
-                    attachment.result_formats.clone(),
-                )
-            })
-            .unwrap_or_default();
+            .owner(code, client_visible)
+            .and_then(|attachment| attachment.transform(code, message));
 
-        for transform in transforms {
-            if !transform.transform.codes.contains(code) {
-                continue;
+        if let Some(name) = failed {
+            error!("plugin \"{name}\" failed to transform a '{code}' message, closing connection");
+
+            // Some of the results may already be with the client, so the
+            // statement can't be completed. Stop the query and the session.
+            if let Err(err) = self.backend.cancel_query().await {
+                error!("failed to cancel query after plugin transform failure: {err}");
             }
-
-            let action = {
-                let payload = message.payload();
-                transform.plugin.vtable().transform(&TransformContext {
-                    handle: transform.transform.handle,
-                    code: code as u8,
-                    // Skip the code and length header.
-                    payload: PdSlice::from(&payload[5..]),
-                    result_formats: PdSlice::from(result_formats.as_slice()),
+            self.backend.force_close();
+            context
+                .stream
+                .fatal(ErrorResponse {
+                    severity: "FATAL".into(),
+                    ..blocked(
+                        "XX000",
+                        format!("plugin \"{name}\" failed to process the query results"),
+                    )
                 })
-            };
+                .await?;
 
-            match action {
-                Ok(TransformAction::Forward) => (),
-                Ok(TransformAction::Replace(body)) => {
-                    let mut payload = BytesMut::with_capacity(body.len() + 5);
-                    payload.put_u8(code as u8);
-                    payload.put_i32(body.len() as i32 + 4);
-                    payload.put_slice(&body);
-                    message.replace_payload(payload.freeze());
-                }
-                Ok(TransformAction::Fail) | Err(_) => {
-                    let name = transform.plugin.name().to_owned();
-                    error!(
-                        "plugin \"{name}\" failed to transform a '{code}' message, closing connection"
-                    );
-
-                    // Some of the results may already be with the client, so the
-                    // statement can't be completed. Stop the query and the session.
-                    if let Err(err) = self.backend.cancel_query().await {
-                        error!("failed to cancel query after plugin transform failure: {err}");
-                    }
-                    self.backend.force_close();
-                    context
-                        .stream
-                        .fatal(ErrorResponse {
-                            severity: "FATAL".into(),
-                            ..blocked(
-                                "XX000",
-                                format!("plugin \"{name}\" failed to process the query results"),
-                            )
-                        })
-                        .await?;
-
-                    return Err(Error::PluginTransform(name));
-                }
-            }
+            return Err(Error::PluginTransform(name.to_owned()));
         }
 
         if code == 'Z' && client_visible {
