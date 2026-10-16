@@ -640,3 +640,31 @@ async fn test_redaction_failure_hides_error() {
     assert_eq!(error.code, "22P02");
     assert!(!error.message.contains(REDACT_PANIC), "{error:?}");
 }
+
+/// Rewritten prepared statements of any type are checked for their
+/// parameters, including those the AST walker doesn't support.
+#[tokio::test]
+async fn test_rewritten_copy_prepared() {
+    let mut client = test_client().await;
+
+    client
+        .send(Parse::named(
+            "copy",
+            format!("COPY (SELECT '{REWRITE}') TO STDOUT"),
+        ))
+        .await;
+    client.send(Bind::new_statement("copy")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+
+    let messages = client.read_until('Z').await.unwrap();
+    let data = messages
+        .iter()
+        .find(|message| message.code() == 'd')
+        .expect("COPY data");
+    assert!(
+        String::from_utf8_lossy(&data.payload()).contains(REWRITTEN),
+        "{data:?}"
+    );
+}

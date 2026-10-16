@@ -37,9 +37,11 @@ use crate::plugin::{LoadedPlugin, has_capability, with_capability};
 
 mod errors;
 mod masks;
+mod params;
 mod pending;
 
 use masks::{MAX_BATCH_BYTES, MAX_BATCH_ROWS, Masking, Plan};
+use params::max_parameter;
 use pending::{Pending, PendingQueue};
 
 /// Who the client authenticated as. Captured when the connection is set up:
@@ -228,20 +230,6 @@ fn out_of_date(name: &str) -> ErrorResponse {
         "26000",
         format!("prepared statement \"{name}\" is out of date, prepare it again"),
     )
-}
-
-/// Highest bind parameter number (`$n`) in a statement, `None` if it doesn't parse.
-fn max_parameter(sql: &str) -> Option<i32> {
-    let tree = pg_raw_parse::parse(sql).ok()?;
-    let mut max = 0;
-    for stmt in tree.stmts() {
-        pg_raw_parse::walk::walk(stmt, |node| {
-            if let pg_raw_parse::Node::ParamRef(param) = node {
-                max = max.max(param.number);
-            }
-        });
-    }
-    Some(max)
 }
 
 /// Ask the statement plugin about a statement.
