@@ -85,10 +85,11 @@ impl QueryEngine {
     pub(super) fn build_simple_split(queries: &[String]) -> QueryEngineResult {
         let requests = queries
             .iter()
-            .map(|query| {
+            .enumerate()
+            .map(|(statement, query)| {
                 let mut request = ClientRequest::from(vec![Query::new(query).into()]);
                 // Split from a request plugins already rewrote.
-                request.plugins_applied = true;
+                request.split_statement = Some(statement);
                 request
             })
             .collect_vec();

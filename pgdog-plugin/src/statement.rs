@@ -133,7 +133,9 @@ impl MaskId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ColumnMask {
     /// Which result set of the statement, counting from 0. Only simple queries
-    /// with several statements have more than one.
+    /// with several statements have more than one: it's the statement's
+    /// position in the (rewritten) query, counting every statement, including
+    /// ones that return no rows.
     pub result: u16,
     /// Column position in the result set, counting from 0.
     pub column: u16,

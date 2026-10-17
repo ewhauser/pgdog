@@ -115,6 +115,14 @@ impl PendingQueue {
         self.queue.clear();
     }
 
+    /// The simple query being answered moves on to its statement at
+    /// `statement`, sent on its own.
+    pub(super) fn start_statement(&mut self, statement: usize) {
+        if let Some(Pending::Query { result, .. }) = self.queue.front_mut() {
+            *result = u16::try_from(statement).unwrap_or(u16::MAX);
+        }
+    }
+
     /// The mask plan of what a server message responds to. Consumes the pending
     /// client message the server message completes.
     pub(super) fn masking(&mut self, code: char, client_visible: bool) -> Option<Masking> {

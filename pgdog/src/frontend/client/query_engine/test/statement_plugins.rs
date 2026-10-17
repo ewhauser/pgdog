@@ -447,6 +447,21 @@ async fn test_masked_second_result() {
     assert_eq!(values(&messages), ["first", "SECOND"]);
 }
 
+/// PgDog answers the SET of a split query itself, without the server's
+/// CommandComplete; the SELECT is still the query's second result.
+#[tokio::test]
+async fn test_masked_result_after_split_set() {
+    let mut client = test_client().await;
+
+    client
+        .send_simple(Query::new(format!(
+            "SET application_name = 'split'; SELECT 'second' /* {MASK_SECOND} */"
+        )))
+        .await;
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(values(&messages), ["SECOND"]);
+}
+
 #[tokio::test]
 async fn test_mask_failure_closes_connection() {
     let mut client = test_client().await;

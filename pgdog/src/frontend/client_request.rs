@@ -39,9 +39,9 @@ pub(crate) struct ClientRequest {
     pub(crate) last_parse: Option<Parse>,
     /// How many parameters the client wrote in the unnamed prepared statement
     pub(crate) anonymous_client_params: Option<u16>,
-    /// Statement plugins already ran on this request: it's part of a request
-    /// PgDog split up itself.
-    pub(crate) plugins_applied: bool,
+    /// Position of this request's statement in a simple query PgDog split up
+    /// itself. Statement plugins already ran on the whole query.
+    pub(crate) split_statement: Option<usize>,
 }
 
 impl MemoryUsage for ClientRequest {
@@ -70,7 +70,7 @@ impl ClientRequest {
             routing_comment: None,
             last_parse: None,
             anonymous_client_params: None,
-            plugins_applied: false,
+            split_statement: None,
         }
     }
 
@@ -105,7 +105,7 @@ impl ClientRequest {
         self.messages.clear();
         self.route = None;
         self.ast = None;
-        self.plugins_applied = false;
+        self.split_statement = None;
     }
 
     /// We received a complete request and we are ready to
@@ -232,7 +232,7 @@ impl ClientRequest {
             routing_comment: self.routing_comment.clone(),
             last_parse: None,
             anonymous_client_params: self.anonymous_client_params,
-            plugins_applied: self.plugins_applied,
+            split_statement: self.split_statement,
         }
     }
 
@@ -419,7 +419,7 @@ impl From<Vec<ProtocolMessage>> for ClientRequest {
             routing_comment: None,
             last_parse: None,
             anonymous_client_params: None,
-            plugins_applied: false,
+            split_statement: None,
         }
     }
 }

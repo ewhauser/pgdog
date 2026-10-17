@@ -168,7 +168,7 @@ See [pgdog-plugin/src/statement.rs](../pgdog-plugin/src/statement.rs) and [pgdog
 
 ### Masks
 
-A rewrite can name result columns to mask with [`ColumnMask`](../pgdog-plugin/src/statement.rs): a column position, which result set it's in (only multi-statement queries have more than one), a plugin-defined `MaskId`, the column's type OID, and whether the mask may block. Use masks for values computed in code rather than SQL, e.g. a keyed hash whose key must not appear in the statement, tokens from a vault, or noise added to a number. The plugin needs the `MASK` capability.
+A rewrite can name result columns to mask with [`ColumnMask`](../pgdog-plugin/src/statement.rs): a column position, which result set it's in (only multi-statement queries have more than one: it's the statement's position in the query, counting every statement, including `BEGIN` or `SET`, even when PgDog answers them itself), a plugin-defined `MaskId`, the column's type OID, and whether the mask may block. Use masks for values computed in code rather than SQL, e.g. a keyed hash whose key must not appear in the statement, tokens from a vault, or noise added to a number. The plugin needs the `MASK` capability.
 
 `ColumnMask::null(column)` replaces a column's values with `NULL` without calling the plugin, whatever the column's type, e.g. for values computed from data the user can't see.
 

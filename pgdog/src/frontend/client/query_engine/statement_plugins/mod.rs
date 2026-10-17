@@ -319,7 +319,10 @@ impl QueryEngine {
         };
 
         // Parts of a request PgDog split itself; the plugin has seen the whole request.
-        if client_request.plugins_applied {
+        if let Some(statement) = client_request.split_statement {
+            // PgDog answers some parts itself, without the server's
+            // CommandComplete, so results are numbered by part.
+            self.statement_plugins.pending.start_statement(statement);
             return Ok(None);
         }
 
