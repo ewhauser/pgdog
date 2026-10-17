@@ -38,12 +38,8 @@
 //!     }
 //!
 //!     fn statement(_session: &Session<'_>, sql: &str) -> Verdict {
-//!         Verdict::Rewrite {
-//!             sql: sql.to_owned(),
-//!             // A text column (type OID 25).
-//!             columns: vec![ColumnMask::new(0, MaskId(1), 25)],
-//!             redact_errors: false,
-//!         }
+//!         // Mask the first column, a text column (type OID 25).
+//!         Verdict::rewrite_masked(sql, vec![ColumnMask::new(0, MaskId(1), 25)])
 //!     }
 //!
 //!     fn mask_rows(batch: &MaskBatch<'_>, out: &mut MaskOutput) -> Result<(), MaskError> {
@@ -103,6 +99,7 @@ impl<'a> Value<'a> {
 }
 
 /// Values of one masked column, one per row of the batch.
+#[non_exhaustive]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct MaskColumn<'a> {
@@ -136,6 +133,7 @@ impl<'a> MaskColumn<'a> {
 }
 
 /// A batch of rows to mask.
+#[non_exhaustive]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct MaskBatch<'a> {
@@ -200,6 +198,7 @@ impl MaskOutput {
 
 /// The plugin couldn't mask a batch. PgDog fails the statement and closes the
 /// client connection, since earlier rows may already be with the client.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaskError(pub String);
 

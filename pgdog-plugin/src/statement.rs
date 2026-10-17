@@ -1,8 +1,10 @@
 //! Statement hook: rewrite or deny statements before PgDog parses them.
 //!
-//! PgDog calls [`crate::Plugin::statement`] with the SQL of every simple `Query`
-//! and extended protocol `Parse` a client sends, before its own query parser,
-//! rewrite engine and router run. The plugin returns a [`Verdict`]:
+//! PgDog calls [`crate::Plugin::statement`] for every simple `Query` and
+//! extended protocol `Parse` a client sends, before its own query parser,
+//! rewrite engine and router run, with the SQL to check: in this version it is
+//! the client's SQL, and a later version may pass SQL an earlier plugin already
+//! rewrote. The plugin returns a [`Verdict`]:
 //!
 //! - [`Verdict::Allow`]: send the statement unchanged;
 //! - [`Verdict::Rewrite`]: send different SQL instead, optionally masking some
@@ -86,6 +88,7 @@ impl SqlState {
 }
 
 /// An error returned to the client instead of running a statement.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Deny {
     /// SQLSTATE of the error.
@@ -129,6 +132,7 @@ impl MaskId {
 /// the client asked for (see [`crate::MaskColumn::format`]). PgDog checks the
 /// type when it sees the statement's `RowDescription`, and fails the statement
 /// if it differs.
+#[non_exhaustive]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ColumnMask {
@@ -191,11 +195,13 @@ impl ColumnMask {
 }
 
 /// What PgDog should do with a statement.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Send the statement unchanged.
     Allow,
     /// Send `sql` instead, and mask `columns` of its results.
+    #[non_exhaustive]
     Rewrite {
         /// Replacement SQL. May be the original SQL, to only mask columns.
         sql: String,
@@ -215,15 +221,32 @@ pub enum Verdict {
 impl Verdict {
     /// Send `sql` instead, without masking any columns.
     pub fn rewrite(sql: impl Into<String>) -> Self {
+        Self::rewrite_masked(sql, vec![])
+    }
+
+    /// Send `sql` instead, and mask `columns` of its results. `sql` may be the
+    /// original SQL, to only mask columns.
+    pub fn rewrite_masked(sql: impl Into<String>, columns: Vec<ColumnMask>) -> Self {
         Self::Rewrite {
             sql: sql.into(),
-            columns: vec![],
+            columns,
             redact_errors: false,
         }
+    }
+
+    /// Redact the statement's errors and notices: sets `redact_errors` of a
+    /// [`Verdict::Rewrite`]. Leaves [`Verdict::Allow`] and [`Verdict::Deny`]
+    /// unchanged.
+    pub fn redact_errors(mut self, redact: bool) -> Self {
+        if let Self::Rewrite { redact_errors, .. } = &mut self {
+            *redact_errors = redact;
+        }
+        self
     }
 }
 
 /// Whether a fast-path function call may run.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Access {
     /// Let it run.
@@ -357,26 +380,33 @@ mod test {
 
     #[test]
     fn test_verdict_output() {
-        let mut output = VerdictOutput::from(Verdict::Rewrite {
-            sql: "SELECT 1".into(),
-            columns: vec![
+        let verdict = Verdict::rewrite_masked(
+            "SELECT 1",
+            vec![
                 ColumnMask::new(2, MaskId(7), 25).blocking(),
                 ColumnMask::null(3),
             ],
-            redact_errors: true,
-        });
+        )
+        .redact_errors(true);
+        assert_eq!(
+            verdict,
+            Verdict::Rewrite {
+                sql: "SELECT 1".into(),
+                columns: vec![
+                    ColumnMask::new(2, MaskId(7), 25).blocking(),
+                    ColumnMask::null(3),
+                ],
+                redact_errors: true,
+            }
+        );
+        assert_eq!(Verdict::Allow.redact_errors(true), Verdict::Allow);
+        let mut output = VerdictOutput::from(verdict);
         assert_eq!(output.action(), VERDICT_REWRITE);
         assert_eq!(output.sql().as_str(), Some("SELECT 1"));
         assert_eq!(
             output.columns(),
             &[
-                ColumnMask {
-                    result: 0,
-                    column: 2,
-                    mask: MaskId(7),
-                    type_oid: 25,
-                    blocking: true,
-                },
+                ColumnMask::new(2, MaskId(7), 25).blocking(),
                 ColumnMask::null(3)
             ]
         );

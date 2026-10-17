@@ -211,8 +211,10 @@ pub trait Plugin {
         Self::capabilities().bits()
     }
 
-    /// Decide what a statement may do: allow, rewrite or deny it. Called with
-    /// the SQL of every simple `Query` and extended protocol `Parse`.
+    /// Decide what a statement may do: allow, rewrite or deny it. Called for
+    /// every simple `Query` and extended protocol `Parse` with the SQL to
+    /// check: in this version it is the client's SQL, and a later version may
+    /// pass SQL an earlier plugin already rewrote.
     /// Requires [`Capabilities::STATEMENT`]. See [`crate::statement`].
     fn statement(_session: &Session<'_>, _sql: &str) -> Verdict {
         Verdict::Allow
@@ -641,11 +643,10 @@ mod test {
             match sql {
                 "panic" => panic!("statement hook panicked"),
                 "deny" => Verdict::Deny(Deny::insufficient_privilege("denied")),
-                "mask" => Verdict::Rewrite {
-                    sql: "SELECT 1".into(),
-                    columns: vec![ColumnMask::new(1, MaskId(9), 25)],
-                    redact_errors: true,
-                },
+                "mask" => {
+                    Verdict::rewrite_masked("SELECT 1", vec![ColumnMask::new(1, MaskId(9), 25)])
+                        .redact_errors(true)
+                }
                 sql => Verdict::rewrite(format!("{sql} /* {} */", &*session.user)),
             }
         }
@@ -688,10 +689,7 @@ mod test {
     static VTABLE: PluginVtable = PluginVtable::from_plugin::<TestPlugin>();
 
     fn session() -> Session<'static> {
-        Session {
-            user: "alice".into(),
-            ..Default::default()
-        }
+        Session::new("alice".into(), "db".into())
     }
 
     fn mask(values: &[Option<&[u8]>]) -> Result<Vec<Option<Vec<u8>>>, HookError> {
@@ -732,11 +730,8 @@ mod test {
         );
         assert_eq!(
             VTABLE.statement(&session, "mask").unwrap(),
-            Verdict::Rewrite {
-                sql: "SELECT 1".into(),
-                columns: vec![ColumnMask::new(1, MaskId(9), 25)],
-                redact_errors: true,
-            }
+            Verdict::rewrite_masked("SELECT 1", vec![ColumnMask::new(1, MaskId(9), 25)])
+                .redact_errors(true)
         );
         assert_eq!(
             VTABLE.statement(&session, "panic"),
@@ -775,18 +770,9 @@ mod test {
     fn test_redact_hook() {
         let error = |message: &'static str| {
             vec![
-                ErrorField {
-                    code: field::SQLSTATE,
-                    value: "23505".into(),
-                },
-                ErrorField {
-                    code: field::MESSAGE,
-                    value: message.into(),
-                },
-                ErrorField {
-                    code: field::DETAIL,
-                    value: "secret".into(),
-                },
+                ErrorField::new(field::SQLSTATE, "23505".into()),
+                ErrorField::new(field::MESSAGE, message.into()),
+                ErrorField::new(field::DETAIL, "secret".into()),
             ]
         };
         let session = session();

@@ -71,6 +71,7 @@ impl BitOrAssign for CatalogParts {
 }
 
 /// The catalog of one database.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Catalog {
     /// Parts that were loaded.
@@ -87,7 +88,18 @@ pub struct Catalog {
     pub operators: Vec<Operator>,
 }
 
+impl Catalog {
+    /// An empty catalog with `parts` loaded.
+    pub fn new(parts: CatalogParts) -> Self {
+        Self {
+            parts,
+            ..Default::default()
+        }
+    }
+}
+
 /// Kind of relation.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RelationKind {
     Table,
@@ -99,6 +111,7 @@ pub enum RelationKind {
 }
 
 /// A relation from `pg_class`.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relation {
     pub schema: String,
@@ -114,7 +127,23 @@ pub struct Relation {
     pub options: Vec<String>,
 }
 
+impl Relation {
+    /// A relation with no columns.
+    pub fn new(schema: impl Into<String>, name: impl Into<String>, kind: RelationKind) -> Self {
+        Self {
+            schema: schema.into(),
+            name: name.into(),
+            kind,
+            columns: vec![],
+            parent: None,
+            definition: None,
+            options: vec![],
+        }
+    }
+}
+
 /// A column of a relation.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Column {
     pub name: String,
@@ -133,14 +162,37 @@ pub struct Column {
     pub security_labels: Vec<SecurityLabel>,
 }
 
+impl Column {
+    /// A column named `name` of type `data_type`.
+    pub fn new(name: impl Into<String>, data_type: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            data_type: data_type.into(),
+            ..Default::default()
+        }
+    }
+}
+
 /// A security label set with `SECURITY LABEL FOR <provider> ON ...`.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct SecurityLabel {
     pub provider: String,
     pub label: String,
 }
 
+impl SecurityLabel {
+    /// A label set by `provider`.
+    pub fn new(provider: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            label: label.into(),
+        }
+    }
+}
+
 /// A function or procedure from `pg_proc`.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Function {
     pub oid: u32,
@@ -180,7 +232,20 @@ pub struct Function {
     pub extension: Option<String>,
 }
 
+impl Function {
+    /// A function with the given OID and name, and every other field empty.
+    pub fn new(oid: u32, schema: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            oid,
+            schema: schema.into(),
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+}
+
 /// An operator from `pg_operator`.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Operator {
     pub oid: u32,
@@ -194,4 +259,16 @@ pub struct Operator {
     pub function_oid: u32,
     pub function_schema: String,
     pub function_name: String,
+}
+
+impl Operator {
+    /// An operator with the given OID and name, and every other field empty.
+    pub fn new(oid: u32, schema: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            oid,
+            schema: schema.into(),
+            name: name.into(),
+            ..Default::default()
+        }
+    }
 }

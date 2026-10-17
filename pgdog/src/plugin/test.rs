@@ -75,11 +75,7 @@ impl Plugin for TestPlugin {
     }
 
     fn statement(session: &Session<'_>, sql: &str) -> Verdict {
-        let mask = |mask: ColumnMask| Verdict::Rewrite {
-            sql: sql.to_owned(),
-            columns: vec![mask],
-            redact_errors: false,
-        };
+        let mask = |mask: ColumnMask| Verdict::rewrite_masked(sql, vec![mask]);
 
         if sql.contains(BLOCK) {
             Verdict::Deny(Deny::insufficient_privilege(format!(
@@ -88,17 +84,12 @@ impl Plugin for TestPlugin {
             )))
         } else if sql.contains(MASK_NULL) {
             // The second column through the plugin, the first replaced with NULL.
-            Verdict::Rewrite {
-                sql: sql.to_owned(),
-                columns: vec![ColumnMask::null(0), ColumnMask::new(1, UPPERCASE, TEXT)],
-                redact_errors: false,
-            }
+            Verdict::rewrite_masked(
+                sql,
+                vec![ColumnMask::null(0), ColumnMask::new(1, UPPERCASE, TEXT)],
+            )
         } else if sql.contains(REDACT_ERRORS) {
-            Verdict::Rewrite {
-                sql: sql.to_owned(),
-                columns: vec![],
-                redact_errors: true,
-            }
+            Verdict::rewrite(sql).redact_errors(true)
         } else if sql.contains(MASK_FAIL) {
             mask(ColumnMask::new(0, FAIL, TEXT))
         } else if sql.contains(MASK_BLOCKING) {

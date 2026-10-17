@@ -52,17 +52,11 @@ pub(super) fn redact(session: &Session<'_>, message: &mut Message) {
         let fields: Vec<ErrorField<'_>> = match &current {
             Some(fields) => fields
                 .iter()
-                .map(|(code, value)| ErrorField {
-                    code: *code,
-                    value: value.as_str().into(),
-                })
+                .map(|(code, value)| ErrorField::new(*code, value.as_str().into()))
                 .collect(),
             None => original
                 .iter()
-                .map(|(code, value)| ErrorField {
-                    code: *code,
-                    value: value.as_ref().into(),
-                })
+                .map(|(code, value)| ErrorField::new(*code, value.as_ref().into()))
                 .collect(),
         };
         let error = ErrorFields::new(code == 'N', &fields);

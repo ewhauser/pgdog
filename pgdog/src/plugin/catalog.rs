@@ -17,14 +17,13 @@ pub(super) fn from_schema(schema: &Schema, parts: CatalogParts) -> Catalog {
     // Stable order, independent of hashing.
     relations.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
 
-    Catalog {
-        parts,
-        search_path: schema.search_path.clone(),
-        relations,
-        functions: schema.functions.iter().map(function).collect(),
-        system_functions: schema.system_functions.clone(),
-        operators: schema.operators.iter().map(operator).collect(),
-    }
+    let mut catalog = Catalog::new(parts);
+    catalog.search_path = schema.search_path.clone();
+    catalog.relations = relations;
+    catalog.functions = schema.functions.iter().map(function).collect();
+    catalog.system_functions = schema.system_functions.clone();
+    catalog.operators = schema.operators.iter().map(operator).collect();
+    catalog
 }
 
 fn relation(relation: &pgdog_stats::Relation) -> Relation {
@@ -37,77 +36,63 @@ fn relation(relation: &pgdog_stats::Relation) -> Relation {
         _ => RelationKind::Other,
     };
 
-    Relation {
-        schema: relation.schema.clone(),
-        name: relation.name.clone(),
-        kind,
-        columns: relation.columns.values().map(column).collect(),
-        parent: relation
-            .parent_table_schema
-            .clone()
-            .zip(relation.parent_table_name.clone()),
-        definition: relation.definition.clone(),
-        options: relation.options.clone(),
-    }
+    let mut out = Relation::new(&relation.schema, &relation.name, kind);
+    out.columns = relation.columns.values().map(column).collect();
+    out.parent = relation
+        .parent_table_schema
+        .clone()
+        .zip(relation.parent_table_name.clone());
+    out.definition = relation.definition.clone();
+    out.options = relation.options.clone();
+    out
 }
 
 fn column(column: &pgdog_stats::Column) -> Column {
-    Column {
-        name: column.column_name.clone(),
-        data_type: column.data_type.clone(),
-        type_name: column.type_name.clone(),
-        type_oid: column.type_oid,
-        is_primary_key: column.is_primary_key,
-        comment: column.comment.clone(),
-        security_labels: column
-            .security_labels
-            .iter()
-            .map(|label| SecurityLabel {
-                provider: label.provider.clone(),
-                label: label.label.clone(),
-            })
-            .collect(),
-    }
+    let mut out = Column::new(&column.column_name, &column.data_type);
+    out.type_name = column.type_name.clone();
+    out.type_oid = column.type_oid;
+    out.is_primary_key = column.is_primary_key;
+    out.comment = column.comment.clone();
+    out.security_labels = column
+        .security_labels
+        .iter()
+        .map(|label| SecurityLabel::new(&label.provider, &label.label))
+        .collect();
+    out
 }
 
 fn function(function: &pgdog_stats::Function) -> Function {
-    Function {
-        oid: function.oid as u32,
-        schema: function.schema.clone(),
-        name: function.name.clone(),
-        kind: function.kind.clone(),
-        argument_types: function.argument_types.clone(),
-        argument_names: function.argument_names.clone(),
-        argument_defaults: function.argument_defaults.max(0) as u16,
-        variadic: function.variadic,
-        return_type: function.return_type.clone(),
-        result: function.result.clone(),
-        returns_set: function.returns_set,
-        output_names: function.output_names.clone(),
-        output_types: function.output_types.clone(),
-        language: function.language.clone(),
-        source: function.source.clone(),
-        sql_body: function.sql_body.clone(),
-        volatility: function.volatility.clone(),
-        security_definer: function.security_definer,
-        strict: function.strict,
-        config: function.config.clone(),
-        extension: function.extension.clone(),
-    }
+    let mut out = Function::new(function.oid as u32, &function.schema, &function.name);
+    out.kind = function.kind.clone();
+    out.argument_types = function.argument_types.clone();
+    out.argument_names = function.argument_names.clone();
+    out.argument_defaults = function.argument_defaults.max(0) as u16;
+    out.variadic = function.variadic;
+    out.return_type = function.return_type.clone();
+    out.result = function.result.clone();
+    out.returns_set = function.returns_set;
+    out.output_names = function.output_names.clone();
+    out.output_types = function.output_types.clone();
+    out.language = function.language.clone();
+    out.source = function.source.clone();
+    out.sql_body = function.sql_body.clone();
+    out.volatility = function.volatility.clone();
+    out.security_definer = function.security_definer;
+    out.strict = function.strict;
+    out.config = function.config.clone();
+    out.extension = function.extension.clone();
+    out
 }
 
 fn operator(operator: &pgdog_stats::Operator) -> Operator {
-    Operator {
-        oid: operator.oid as u32,
-        schema: operator.schema.clone(),
-        name: operator.name.clone(),
-        left_type: operator.left_type.clone(),
-        right_type: operator.right_type.clone(),
-        result_type: operator.result_type.clone(),
-        function_oid: operator.function_oid as u32,
-        function_schema: operator.function_schema.clone(),
-        function_name: operator.function_name.clone(),
-    }
+    let mut out = Operator::new(operator.oid as u32, &operator.schema, &operator.name);
+    out.left_type = operator.left_type.clone();
+    out.right_type = operator.right_type.clone();
+    out.result_type = operator.result_type.clone();
+    out.function_oid = operator.function_oid as u32;
+    out.function_schema = operator.function_schema.clone();
+    out.function_name = operator.function_name.clone();
+    out
 }
 
 #[cfg(test)]

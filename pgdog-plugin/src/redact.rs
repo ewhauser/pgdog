@@ -80,6 +80,7 @@ pub mod field {
 }
 
 /// One field of an error or notice.
+#[non_exhaustive]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ErrorField<'a> {
@@ -89,7 +90,15 @@ pub struct ErrorField<'a> {
     pub value: PdStr<'a>,
 }
 
+impl<'a> ErrorField<'a> {
+    /// A field with the given code, see [`field`].
+    pub fn new(code: u8, value: PdStr<'a>) -> Self {
+        Self { code, value }
+    }
+}
+
 /// An `ErrorResponse` or `NoticeResponse` sent by Postgres.
+#[non_exhaustive]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ErrorFields<'a> {
@@ -141,6 +150,7 @@ impl<'a> ErrorFields<'a> {
 }
 
 /// What to do with an error or notice.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Redaction {
     /// Send it unchanged.
@@ -226,14 +236,8 @@ mod test {
     #[test]
     fn test_error_fields() {
         let fields = [
-            ErrorField {
-                code: field::SQLSTATE,
-                value: "23505".into(),
-            },
-            ErrorField {
-                code: field::DETAIL,
-                value: "Key (ssn)=(123) already exists.".into(),
-            },
+            ErrorField::new(field::SQLSTATE, "23505".into()),
+            ErrorField::new(field::DETAIL, "Key (ssn)=(123) already exists.".into()),
         ];
         let error = ErrorFields::new(false, &fields);
         assert_eq!(error.sqlstate(), Some("23505"));

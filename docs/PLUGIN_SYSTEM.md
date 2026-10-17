@@ -129,8 +129,8 @@ A plugin declares which hooks it implements by returning a set of [`Capabilities
 | Capability | Hooks | Called |
 |---|---|---|
 | `ROUTE` | `route(Context) -> Route` | For every statement PgDog routes, after parsing. |
-| `STATEMENT` | `statement(&Session, sql) -> Verdict`, `function_call(&Session, oid) -> Access`, `generation() -> u64` | For every `Query` and `Parse`, and every fast-path function call, before PgDog parses, rewrites or routes the statement. At most one loaded plugin can have it. |
-| `MASK` | `mask_rows(&MaskBatch, &mut MaskOutput)` | For batches of result rows with columns a verdict asked to mask. |
+| `STATEMENT` | `statement(&Session, sql) -> Verdict`, `function_call(&Session, oid) -> Access`, `generation() -> u64` | For every `Query` and `Parse`, and every fast-path function call, before PgDog parses, rewrites or routes the statement. In this version, at most one loaded plugin can have it. |
+| `MASK` | `mask_rows(&MaskBatch, &mut MaskOutput)` | For batches of result rows with columns a verdict asked to mask. In this version, requires `STATEMENT`. |
 | `ERRORS` | `redact_error(&Session, &ErrorFields) -> Redaction` | For every `ErrorResponse` and `NoticeResponse` Postgres sends to a client. |
 | `CATALOG` | `catalog_parts() -> CatalogParts`, `catalog(database, &Catalog)` | When a database's schema finishes loading and changed. Makes PgDog load the schema even if `load_schema` would skip it. |
 
@@ -144,10 +144,10 @@ Hooks that run for a client get a [`Session`](../pgdog-plugin/src/session.rs): t
 
 ### Statement hook
 
-The plugin with `STATEMENT` sees the SQL of every simple `Query` and extended protocol `Parse`, and returns a [`Verdict`](../pgdog-plugin/src/statement.rs):
+The plugin with `STATEMENT` is called for every simple `Query` and extended protocol `Parse` with the SQL to check (in this version it is the client's SQL; a later version may pass SQL an earlier plugin already rewrote), and returns a [`Verdict`](../pgdog-plugin/src/statement.rs):
 
 - `Verdict::Allow`: send the statement unchanged;
-- `Verdict::Rewrite { sql, columns, redact_errors }`: send `sql` instead, mask `columns` of its results (see [Masks](#masks)), and, if `redact_errors` is set, redact the statement's errors (see [Statement errors](#statement-errors)). `sql` can be the original statement, to only mask or redact. Everything downstream, including the prepared statements cache, the AST cache, the router and sharding, sees the new SQL;
+- `Verdict::Rewrite { sql, columns, redact_errors }` (built with `Verdict::rewrite`, `Verdict::rewrite_masked` and `Verdict::redact_errors`): send `sql` instead, mask `columns` of its results (see [Masks](#masks)), and, if `redact_errors` is set, redact the statement's errors (see [Statement errors](#statement-errors)). `sql` can be the original statement, to only mask or redact. Everything downstream, including the prepared statements cache, the AST cache, the router and sharding, sees the new SQL;
 - `Verdict::Deny(Deny { sqlstate, message })`: reject the statement with an `ErrorResponse`.
 
 Fast-path function calls carry no SQL, only the function's OID; `function_call` allows or denies them.
@@ -160,7 +160,7 @@ Verdicts must be deterministic: they depend only on the session and the SQL, unt
 - If the new verdict sends different SQL (e.g., the plugin reloaded its configuration), PgDog prepares the statement again with the new SQL, so long-lived prepared statements follow plugin changes. If it can't (the unnamed statement, or prepared statements aren't handled by PgDog), the `Bind` fails with `26000` and the client must prepare the statement again.
 - A rewrite of a `Parse` must keep the statement's bind parameters: PgDog denies it (`XX000`) if its highest parameter number differs from the original's.
 
-Only one plugin can have `STATEMENT`: a rewrite changes the columns another plugin's masks would refer to, so verdicts of several plugins can't be combined. A second one fails to load.
+In this version, at most one loaded plugin can have `STATEMENT`: a rewrite changes the columns another plugin's masks would refer to, so verdicts of several plugins aren't combined. A second one fails to load.
 
 The statement hook isn't called for admin database commands, and multi-statement queries PgDog splits internally are checked once, as the client sent them.
 
@@ -168,7 +168,7 @@ See [pgdog-plugin/src/statement.rs](../pgdog-plugin/src/statement.rs) and [pgdog
 
 ### Masks
 
-A rewrite can name result columns to mask with [`ColumnMask`](../pgdog-plugin/src/statement.rs): a column position, which result set it's in (only multi-statement queries have more than one: it's the statement's position in the query, counting every statement, including `BEGIN` or `SET`, even when PgDog answers them itself), a plugin-defined `MaskId`, the column's type OID, and whether the mask may block. Use masks for values computed in code rather than SQL, e.g. a keyed hash whose key must not appear in the statement, tokens from a vault, or noise added to a number. The plugin needs the `MASK` capability.
+A rewrite can name result columns to mask with [`ColumnMask`](../pgdog-plugin/src/statement.rs): a column position, which result set it's in (only multi-statement queries have more than one: it's the statement's position in the query, counting every statement, including `BEGIN` or `SET`, even when PgDog answers them itself), a plugin-defined `MaskId`, the column's type OID, and whether the mask may block. Use masks for values computed in code rather than SQL, e.g. a keyed hash whose key must not appear in the statement, tokens from a vault, or noise added to a number. The plugin needs the `MASK` capability, which in this version requires `STATEMENT`, since only the statement plugin's verdicts name columns to mask.
 
 `ColumnMask::null(column)` replaces a column's values with `NULL` without calling the plugin, whatever the column's type, e.g. for values computed from data the user can't see.
 

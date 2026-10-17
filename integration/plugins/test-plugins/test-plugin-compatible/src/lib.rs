@@ -46,11 +46,7 @@ impl Plugin for TestPlugin {
         } else if sql.contains(REWRITE) {
             Verdict::rewrite(sql.replace(REWRITE, REWRITTEN))
         } else if sql.contains(UPPERCASE) {
-            Verdict::Rewrite {
-                sql: sql.to_owned(),
-                columns: vec![ColumnMask::new(0, MaskId(1), 25)],
-                redact_errors: false,
-            }
+            Verdict::rewrite_masked(sql, vec![ColumnMask::new(0, MaskId(1), 25)])
         } else {
             Verdict::Allow
         }

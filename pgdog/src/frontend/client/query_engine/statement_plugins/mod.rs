@@ -151,16 +151,16 @@ impl<'a> SessionStrings<'a> {
     }
 
     fn session(&self) -> Session<'_> {
-        Session {
-            user: self.identity.user.as_str().into(),
-            database: self.identity.database.as_str().into(),
-            tls_identity: self.connection.tls_identity.as_str().into(),
-            search_path: self.search_path.as_ref().into(),
-            client: ClientInfo {
-                application_name: self.application_name.as_ref().into(),
-                addr: self.connection.addr.as_str().into(),
-            },
-        }
+        Session::new(
+            self.identity.user.as_str().into(),
+            self.identity.database.as_str().into(),
+        )
+        .with_tls_identity(self.connection.tls_identity.as_str().into())
+        .with_search_path(self.search_path.as_ref().into())
+        .with_client(ClientInfo::new(
+            self.application_name.as_ref().into(),
+            self.connection.addr.as_str().into(),
+        ))
     }
 }
 
@@ -258,6 +258,7 @@ fn decide(
             sql: rewritten,
             columns,
             redact_errors,
+            ..
         }) => {
             if (!columns.is_empty() || redact_errors) && !plugin.has(Capabilities::MASK) {
                 return Err(failed(
@@ -278,6 +279,8 @@ fn decide(
                 plan: plan(plugin, columns, redact_errors),
             })
         }
+        // Fail closed on a verdict this version of PgDog doesn't know.
+        Ok(_) => Err(failed("returned an unknown verdict".into())),
     }
 }
 
@@ -494,6 +497,13 @@ impl QueryEngine {
                         Ok(Access::Allow) => (),
                         Ok(Access::Deny(deny)) => {
                             return Ok(Some(denied(deny.sqlstate.as_str(), deny.message)));
+                        }
+                        // Fail closed on a verdict this version of PgDog doesn't know.
+                        Ok(_) => {
+                            return Ok(Some(denied(
+                                "XX000",
+                                format!("plugin \"{}\" returned an unknown verdict", plugin.name()),
+                            )));
                         }
                         Err(err) => {
                             return Ok(Some(denied(
