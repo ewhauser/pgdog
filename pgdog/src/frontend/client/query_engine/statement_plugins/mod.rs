@@ -638,9 +638,9 @@ impl QueryEngine {
         while rows.len() < MAX_BATCH_ROWS && bytes < MAX_BATCH_BYTES {
             match self.backend.read().now_or_never() {
                 Some(Ok(message)) if message.code() == 'D' => {
+                    // The pending queue needs no update: a `DataRow` leaves the
+                    // statement that produced the first one at its head.
                     self.data_row_received(&message);
-                    // Keeps the pending queue in step; the masking is the same.
-                    self.statement_plugins.pending.masking('D', true);
                     bytes += message.len();
                     rows.push(message);
                 }

@@ -47,9 +47,13 @@ pub(crate) static VERSIONED_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Number of batches masked.
 pub(crate) static MASK_BATCHES: AtomicU64 = AtomicU64::new(0);
 
-const UPPERCASE: MaskId = MaskId(1);
+pub(crate) const UPPERCASE: MaskId = MaskId(1);
 const FAIL: MaskId = MaskId(2);
 const INCREMENT: MaskId = MaskId(3);
+/// Replaces text with 64 bytes, like a hex digest: longer than most values.
+pub(crate) const DIGEST: MaskId = MaskId(4);
+/// What [`DIGEST`] masks values to.
+pub(crate) const DIGEST_VALUE: [u8; 64] = [b'f'; 64];
 
 const TEXT: u32 = 25;
 const INTEGER: u32 = 23;
@@ -109,6 +113,12 @@ impl Plugin for TestPlugin {
             if column.mask == FAIL {
                 return Err(MaskError::new("test mask failed"));
             }
+            if column.mask == DIGEST {
+                for value in column.values() {
+                    out.push(value.map(|_| DIGEST_VALUE.as_slice()));
+                }
+                continue;
+            }
             for value in column.values() {
                 let masked = match value {
                     None => None,
@@ -153,6 +163,15 @@ impl Plugin for TestPlugin {
 }
 
 static VTABLE: PluginVtable = PluginVtable::from_plugin::<TestPlugin>();
+
+/// The test plugin, loaded.
+pub(crate) fn test_plugin() -> &'static LoadedPlugin {
+    load_test_plugin();
+    super::plugins()
+        .iter()
+        .find(|plugin| plugin.name() == "test")
+        .expect("test plugin is loaded")
+}
 
 /// Load the test plugin. Idempotent.
 pub(crate) fn load_test_plugin() {
