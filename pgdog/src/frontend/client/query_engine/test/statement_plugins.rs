@@ -706,3 +706,92 @@ async fn test_rewritten_copy_prepared() {
         "{data:?}"
     );
 }
+
+/// NULL masks are applied by PgDog to a column of any type, next to columns
+/// the plugin masks.
+#[tokio::test]
+async fn test_null_masks() {
+    let mut client = test_client().await;
+
+    client
+        .send_simple(Query::new(format!(
+            "SELECT 42 AS n, 'secret' AS v /* {MASK_NULL} */"
+        )))
+        .await;
+    let messages = client.read_until('Z').await.unwrap();
+    let row = messages
+        .iter()
+        .find(|message| message.code() == 'D')
+        .unwrap();
+    let row = DataRow::try_from(row.clone()).unwrap();
+    assert_eq!(row.get::<i32>(0, Format::Text), None, "an integer, NULL");
+    assert_eq!(row.get::<String>(1, Format::Text).unwrap(), "SECRET");
+
+    // Only NULL masks: the plugin isn't called.
+    client
+        .send(Parse::named(
+            "null_only",
+            format!("SELECT 1 /* {MASK_NULL} */, 'x'::text"),
+        ))
+        .await;
+    client.send(Bind::new_statement("null_only")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    expect_message!(client.read().await, ParseComplete);
+    let messages = client.read_until('Z').await.unwrap();
+    let row = messages
+        .iter()
+        .find(|message| message.code() == 'D')
+        .unwrap();
+    let row = DataRow::try_from(row.clone()).unwrap();
+    assert_eq!(row.get::<i32>(0, Format::Text), None);
+}
+
+/// Errors of statements whose verdict asks for it lose their message, keeping
+/// their SQLSTATE; other statements' errors are untouched.
+#[tokio::test]
+async fn test_statement_errors_redacted() {
+    let mut client = test_client().await;
+
+    client
+        .send_simple(Query::new(format!(
+            "SELECT 'sensitive-value'::int /* {REDACT_ERRORS} */"
+        )))
+        .await;
+    let error = client.read_until('Z').await.unwrap_err();
+    assert_eq!(error.code, "22P02");
+    assert!(!error.message.contains("sensitive-value"), "{error:?}");
+    expect_message!(client.read().await, ReadyForQuery);
+
+    // Extended protocol: an error while parsing (the constant is converted
+    // then), and one while executing.
+    for (name, sql) in [
+        ("redacted_parse", "SELECT 'sensitive-value'::int"),
+        (
+            "redacted_execute",
+            "SELECT x::int FROM (VALUES ('sensitive-value')) v(x)",
+        ),
+    ] {
+        client
+            .send(Parse::named(name, format!("{sql} /* {REDACT_ERRORS} */")))
+            .await;
+        client.send(Bind::new_statement(name)).await;
+        client.send(Execute::new()).await;
+        client.send(Sync).await;
+        client.try_process().await.unwrap();
+        let error = client.read_until('Z').await.unwrap_err();
+        assert_eq!(error.code, "22P02", "{name}");
+        assert!(
+            !error.message.contains("sensitive-value"),
+            "{name}: {error:?}"
+        );
+        expect_message!(client.read().await, ReadyForQuery);
+    }
+
+    client
+        .send_simple(Query::new("SELECT 'plain-value'::int"))
+        .await;
+    let error = client.read_until('Z').await.unwrap_err();
+    assert!(error.message.contains("plain-value"), "{error:?}");
+}

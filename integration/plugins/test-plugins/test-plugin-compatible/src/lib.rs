@@ -49,6 +49,7 @@ impl Plugin for TestPlugin {
             Verdict::Rewrite {
                 sql: sql.to_owned(),
                 columns: vec![ColumnMask::new(0, MaskId(1), 25)],
+                redact_errors: false,
             }
         } else {
             Verdict::Allow

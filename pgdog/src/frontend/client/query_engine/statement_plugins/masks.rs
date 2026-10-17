@@ -13,11 +13,13 @@ pub(super) const MAX_BATCH_ROWS: usize = 256;
 /// Most bytes of rows masked in one call.
 pub(super) const MAX_BATCH_BYTES: usize = 1024 * 1024;
 
-/// Columns to mask, from a statement's verdict.
+/// Columns to mask, and errors to redact, from a statement's verdict.
 #[derive(Debug)]
 pub(super) struct Plan {
     pub(super) plugin: &'static LoadedPlugin,
     pub(super) columns: Vec<ColumnMask>,
+    /// Replace the messages of the statement's errors and notices.
+    pub(super) redact_errors: bool,
 }
 
 /// A portal's mask plan, with the result formats the client asked for in its `Bind`.
@@ -76,7 +78,8 @@ impl Masking {
                 .fields
                 .get(mask.column as usize)
                 .ok_or_else(|| format!("masked column {} doesn't exist", mask.column))?;
-            if field.type_oid as u32 != mask.type_oid {
+            // NULL fits any type.
+            if !mask.is_null() && field.type_oid as u32 != mask.type_oid {
                 return Err(format!(
                     "masked column \"{}\" has type OID {}, the plugin expected {}",
                     field.name, field.type_oid, mask.type_oid
@@ -119,9 +122,22 @@ impl Masking {
             .filter_map(|(column, index)| index.map(|index| (column, index)))
             .collect();
 
-        let values: Vec<Vec<Value<'_>>> = masks
+        // NULL masks are applied here; the plugin gets the other columns.
+        let plugin_masks: Vec<(usize, &ColumnMask)> = masks
             .iter()
-            .map(|mask| {
+            .enumerate()
+            .filter(|(_, mask)| !mask.is_null())
+            .map(|(index, mask)| (index, *mask))
+            .collect();
+        // Mask index -> position among the plugin's columns.
+        let mut plugin_index = vec![None; masks.len()];
+        for (position, (index, _)) in plugin_masks.iter().enumerate() {
+            plugin_index[*index] = Some(position);
+        }
+
+        let values: Vec<Vec<Value<'_>>> = plugin_masks
+            .iter()
+            .map(|(_, mask)| {
                 fields
                     .chunks_exact(width)
                     .zip(&payloads)
@@ -131,20 +147,28 @@ impl Masking {
                     .collect()
             })
             .collect();
-        let columns: Vec<MaskColumn<'_>> = masks
+        let columns: Vec<MaskColumn<'_>> = plugin_masks
             .iter()
             .zip(&values)
-            .map(|(mask, values)| MaskColumn::new(mask, self.format(mask.column), values))
+            .map(|((_, mask), values)| MaskColumn::new(mask, self.format(mask.column), values))
             .collect();
-        let batch = MaskBatch::new(rows.len() as u32, &columns);
-        let output = self
-            .plan
-            .plugin
-            .vtable()
-            .mask_rows(&batch)
-            .map_err(|err| err.to_string())?;
+        let output = if columns.is_empty() {
+            None
+        } else {
+            let batch = MaskBatch::new(rows.len() as u32, &columns);
+            Some(
+                self.plan
+                    .plugin
+                    .vtable()
+                    .mask_rows(&batch)
+                    .map_err(|err| err.to_string())?,
+            )
+        };
         let count = rows.len();
-        let masked_value = |row: usize, index: usize| output.get(index * count + row);
+        let masked_value = |row: usize, index: usize| match (plugin_index[index], &output) {
+            (Some(position), Some(output)) => output.get(position * count + row),
+            _ => None,
+        };
 
         // All rows go in one buffer, sized for the masked values: they are
         // often longer than the originals.
@@ -236,6 +260,7 @@ mod test {
             plan: Arc::new(Plan {
                 plugin: test_plugin(),
                 columns,
+                redact_errors: false,
             }),
             result: 0,
             formats: None,

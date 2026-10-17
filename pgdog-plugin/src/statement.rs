@@ -109,10 +109,17 @@ impl Deny {
     }
 }
 
-/// Identifies one of the plugin's masks. Its meaning is up to the plugin.
+/// Identifies one of the plugin's masks. Its meaning is up to the plugin,
+/// except for [`MaskId::NULL`].
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct MaskId(pub u64);
+
+impl MaskId {
+    /// Replace the column's values with NULL. PgDog applies it itself, without
+    /// calling [`crate::Plugin::mask_rows`], to a column of any type.
+    pub const NULL: Self = Self(u64::MAX);
+}
 
 /// A result column PgDog passes to [`crate::Plugin::mask_rows`].
 ///
@@ -151,6 +158,23 @@ impl ColumnMask {
         }
     }
 
+    /// Replace a column's values with NULL, whatever its type. PgDog applies it
+    /// itself: the plugin never sees the values.
+    pub fn null(column: u16) -> Self {
+        Self {
+            result: 0,
+            column,
+            mask: MaskId::NULL,
+            type_oid: 0,
+            blocking: false,
+        }
+    }
+
+    /// This column is replaced with NULL by PgDog.
+    pub fn is_null(&self) -> bool {
+        self.mask == MaskId::NULL
+    }
+
     /// Mask a column of a later result set of a multi-statement query.
     pub fn in_result(mut self, result: u16) -> Self {
         self.result = result;
@@ -173,9 +197,14 @@ pub enum Verdict {
     Rewrite {
         /// Replacement SQL. May be the original SQL, to only mask columns.
         sql: String,
-        /// Result columns to pass to [`crate::Plugin::mask_rows`]. Requires
-        /// [`crate::Capabilities::MASK`].
+        /// Result columns to pass to [`crate::Plugin::mask_rows`], or to replace
+        /// with NULL. Requires [`crate::Capabilities::MASK`].
         columns: Vec<ColumnMask>,
+        /// Replace the message of the statement's errors and notices with a
+        /// generic one, keeping their severity, SQLSTATE and position. For
+        /// statements that compute with values the client mustn't see, whose
+        /// errors could quote them. Requires [`crate::Capabilities::MASK`].
+        redact_errors: bool,
     },
     /// Return an error to the client.
     Deny(Deny),
@@ -187,6 +216,7 @@ impl Verdict {
         Self::Rewrite {
             sql: sql.into(),
             columns: vec![],
+            redact_errors: false,
         }
     }
 }
@@ -215,6 +245,7 @@ pub struct VerdictOutput {
     action: u8,
     sql: PdBuf,
     columns: PdVec<ColumnMask>,
+    redact_errors: bool,
     sqlstate: SqlState,
     message: PdBuf,
 }
@@ -225,6 +256,7 @@ impl VerdictOutput {
             action,
             sql: PdBuf::empty(),
             columns: PdVec::empty(),
+            redact_errors: false,
             sqlstate: SqlState::INTERNAL_ERROR,
             message: PdBuf::empty(),
         }
@@ -265,6 +297,10 @@ impl VerdictOutput {
         self.columns.as_slice()
     }
 
+    pub(crate) fn redact_errors(&self) -> bool {
+        self.redact_errors
+    }
+
     pub(crate) fn denied(&self) -> Deny {
         Deny {
             sqlstate: self.sqlstate,
@@ -277,9 +313,14 @@ impl From<Verdict> for VerdictOutput {
     fn from(verdict: Verdict) -> Self {
         match verdict {
             Verdict::Allow => Self::new(VERDICT_ALLOW),
-            Verdict::Rewrite { sql, columns } => Self {
+            Verdict::Rewrite {
+                sql,
+                columns,
+                redact_errors,
+            } => Self {
                 sql: PdBuf::from(sql),
                 columns: PdVec::from(columns),
+                redact_errors,
                 ..Self::new(VERDICT_REWRITE)
             },
             Verdict::Deny(deny) => Self::deny(deny),
@@ -316,20 +357,29 @@ mod test {
     fn test_verdict_output() {
         let mut output = VerdictOutput::from(Verdict::Rewrite {
             sql: "SELECT 1".into(),
-            columns: vec![ColumnMask::new(2, MaskId(7), 25).blocking()],
+            columns: vec![
+                ColumnMask::new(2, MaskId(7), 25).blocking(),
+                ColumnMask::null(3),
+            ],
+            redact_errors: true,
         });
         assert_eq!(output.action(), VERDICT_REWRITE);
         assert_eq!(output.sql().as_str(), Some("SELECT 1"));
         assert_eq!(
             output.columns(),
-            &[ColumnMask {
-                result: 0,
-                column: 2,
-                mask: MaskId(7),
-                type_oid: 25,
-                blocking: true,
-            }]
+            &[
+                ColumnMask {
+                    result: 0,
+                    column: 2,
+                    mask: MaskId(7),
+                    type_oid: 25,
+                    blocking: true,
+                },
+                ColumnMask::null(3)
+            ]
         );
+        assert!(output.redact_errors());
+        assert!(output.columns()[1].is_null());
         output.free();
 
         let mut output = VerdictOutput::from(Access::Deny(Deny::insufficient_privilege("no")));

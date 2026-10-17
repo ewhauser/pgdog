@@ -529,6 +529,7 @@ impl PluginVtable {
                 Ok(Verdict::Rewrite {
                     sql: sql.to_owned(),
                     columns: output.columns().to_vec(),
+                    redact_errors: output.redact_errors(),
                 })
             }
             VERDICT_DENY => Ok(Verdict::Deny(output.denied())),
@@ -643,6 +644,7 @@ mod test {
                 "mask" => Verdict::Rewrite {
                     sql: "SELECT 1".into(),
                     columns: vec![ColumnMask::new(1, MaskId(9), 25)],
+                    redact_errors: true,
                 },
                 sql => Verdict::rewrite(format!("{sql} /* {} */", &*session.user)),
             }
@@ -733,6 +735,7 @@ mod test {
             Verdict::Rewrite {
                 sql: "SELECT 1".into(),
                 columns: vec![ColumnMask::new(1, MaskId(9), 25)],
+                redact_errors: true,
             }
         );
         assert_eq!(

@@ -42,6 +42,7 @@
 //!             sql: sql.to_owned(),
 //!             // A text column (type OID 25).
 //!             columns: vec![ColumnMask::new(0, MaskId(1), 25)],
+//!             redact_errors: false,
 //!         }
 //!     }
 //!

@@ -257,9 +257,12 @@ fn decide(
         Ok(Verdict::Rewrite {
             sql: rewritten,
             columns,
+            redact_errors,
         }) => {
-            if !columns.is_empty() && !plugin.has(Capabilities::MASK) {
-                return Err(failed("masked columns without the MASK capability".into()));
+            if (!columns.is_empty() || redact_errors) && !plugin.has(Capabilities::MASK) {
+                return Err(failed(
+                    "masked columns or redacted errors without the MASK capability".into(),
+                ));
             }
             // The client binds parameters for the statement it prepared.
             if extended && rewritten != sql {
@@ -272,14 +275,24 @@ fn decide(
             }
             Ok(Decision {
                 sql: (rewritten != sql).then_some(rewritten),
-                plan: plan(plugin, columns),
+                plan: plan(plugin, columns, redact_errors),
             })
         }
     }
 }
 
-fn plan(plugin: &'static LoadedPlugin, columns: Vec<ColumnMask>) -> Option<Arc<Plan>> {
-    (!columns.is_empty()).then(|| Arc::new(Plan { plugin, columns }))
+fn plan(
+    plugin: &'static LoadedPlugin,
+    columns: Vec<ColumnMask>,
+    redact_errors: bool,
+) -> Option<Arc<Plan>> {
+    (!columns.is_empty() || redact_errors).then(|| {
+        Arc::new(Plan {
+            plugin,
+            columns,
+            redact_errors,
+        })
+    })
 }
 
 /// The plugin with the statement hook. There is at most one.
@@ -380,7 +393,7 @@ impl QueryEngine {
                         unnamed = Some(parse.clone());
                     }
                     staged.prepared.push((name, Some(prepared)));
-                    staged.pending.push(Pending::Parse);
+                    staged.pending.push(Pending::Parse(decision.plan.clone()));
                 }
 
                 ProtocolMessage::Bind(bind) => {
@@ -427,12 +440,12 @@ impl QueryEngine {
                     }
                     // Otherwise not prepared through us: let Postgres report the error.
 
+                    staged.pending.push(Pending::Bind(plan.clone()));
                     let plan = plan.map(|plan| PortalPlan {
                         plan,
                         formats: bind.result_formats().collect(),
                     });
                     staged.portals.push((portal, Some(plan)));
-                    staged.pending.push(Pending::Bind);
                 }
 
                 ProtocolMessage::Describe(describe) => {
@@ -610,6 +623,10 @@ impl QueryEngine {
         }
 
         match (code, masking) {
+            ('E' | 'N', Some(masking)) if masking.plan.redact_errors => {
+                errors::redact_statement(message);
+                Ok(None)
+            }
             ('T', Some(masking)) => {
                 if let Err(reason) = masking.check(message) {
                     return Err(self.fail_results(context, &masking, &reason).await);

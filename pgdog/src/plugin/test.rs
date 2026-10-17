@@ -21,6 +21,11 @@ pub(crate) const REWRITTEN: &str = "pgdog_test_rewritten";
 /// This is replaced with `pgdog_test_versioned_{VERSION}`. [`VERSION`] is also
 /// the plugin's generation.
 pub(crate) const VERSIONED: &str = "pgdog_test_version";
+/// The first column of these statements is replaced with NULL by PgDog, and
+/// the second, text, uppercased by the plugin.
+pub(crate) const MASK_NULL: &str = "pgdog_test_null_mask";
+/// Errors and notices of these statements are redacted.
+pub(crate) const REDACT_ERRORS: &str = "pgdog_test_redact_errors";
 /// The first column of these statements, text, is uppercased by the plugin.
 pub(crate) const MASK: &str = "pgdog_test_mask";
 /// The first column of these statements, an integer, is incremented by the plugin.
@@ -73,6 +78,7 @@ impl Plugin for TestPlugin {
         let mask = |mask: ColumnMask| Verdict::Rewrite {
             sql: sql.to_owned(),
             columns: vec![mask],
+            redact_errors: false,
         };
 
         if sql.contains(BLOCK) {
@@ -80,6 +86,19 @@ impl Plugin for TestPlugin {
                 "blocked for {}",
                 &*session.user
             )))
+        } else if sql.contains(MASK_NULL) {
+            // The second column through the plugin, the first replaced with NULL.
+            Verdict::Rewrite {
+                sql: sql.to_owned(),
+                columns: vec![ColumnMask::null(0), ColumnMask::new(1, UPPERCASE, TEXT)],
+                redact_errors: false,
+            }
+        } else if sql.contains(REDACT_ERRORS) {
+            Verdict::Rewrite {
+                sql: sql.to_owned(),
+                columns: vec![],
+                redact_errors: true,
+            }
         } else if sql.contains(MASK_FAIL) {
             mask(ColumnMask::new(0, FAIL, TEXT))
         } else if sql.contains(MASK_BLOCKING) {

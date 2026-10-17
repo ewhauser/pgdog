@@ -86,6 +86,33 @@ pub(super) fn redact(session: &Session<'_>, message: &mut Message) {
     }
 }
 
+/// Replaces the message of errors from statements whose errors the plugin
+/// asked to redact.
+const STATEMENT_REDACTED: &str =
+    "error message removed: the statement reads values this user can't see";
+
+/// Fields kept when a statement's errors are redacted: they describe where
+/// the error is, not the data. Severity and SQLSTATE are always kept.
+const LOCATION_FIELDS: &[u8] = b"PFLRstcdn";
+
+/// Replace the message of an error or notice from a statement whose errors
+/// the plugin asked to redact, e.g. one that compares values its user can't
+/// see, which an error such as `invalid input syntax` would quote. Keeps the
+/// severity, SQLSTATE, position and the names of the objects involved.
+pub(super) fn redact_statement(message: &mut Message) {
+    let payload = message.payload();
+    let code = message.code();
+    let original = parse(&payload).unwrap_or_default();
+    let mut redacted: Vec<(u8, String)> = vec![(MESSAGE, STATEMENT_REDACTED.into())];
+    redacted.extend(
+        original
+            .iter()
+            .filter(|(field, _)| LOCATION_FIELDS.contains(field))
+            .map(|(field, value)| (*field, value.to_string())),
+    );
+    message.replace_payload(encode(code, &original, &redacted).freeze());
+}
+
 /// Build the redacted message: the original severity and SQLSTATE, then the
 /// plugin's fields.
 fn encode(code: char, original: &[(u8, Cow<'_, str>)], redacted: &[(u8, String)]) -> BytesMut {
@@ -120,7 +147,7 @@ fn encode(code: char, original: &[(u8, Cow<'_, str>)], redacted: &[(u8, String)]
 mod test {
     use super::*;
     use crate::net::{ErrorResponse, FromBytes, ToBytes};
-    use pgdog_plugin::redact::field::DETAIL;
+    use pgdog_plugin::redact::field::{DETAIL, POSITION};
 
     #[test]
     fn test_parse_and_encode() {
@@ -146,5 +173,32 @@ mod test {
         assert_eq!(error.severity, "ERROR");
         assert_eq!(error.message, "");
         assert_eq!(error.detail, None);
+    }
+
+    #[test]
+    fn test_redact_statement() {
+        let error = ErrorResponse {
+            code: "22P02".into(),
+            message: "invalid input syntax for type integer: \"123-45-6789\"".into(),
+            detail: Some("123-45-6789".into()),
+            ..Default::default()
+        };
+        let mut payload = error.to_bytes().to_vec();
+        // Add a position field before the terminator.
+        payload.pop();
+        payload.extend(b"P42\0\0");
+        let len = payload.len() as i32 - 1;
+        payload[1..5].copy_from_slice(&len.to_be_bytes());
+        let mut message = Message::new(payload.into());
+
+        redact_statement(&mut message);
+        let payload = message.payload();
+        let fields = parse(&payload).unwrap();
+        let text = format!("{fields:?}");
+        assert!(!text.contains("123-45-6789"), "{text}");
+        assert!(fields.contains(&(SQLSTATE, "22P02".into())));
+        assert!(fields.contains(&(POSITION, "42".into())));
+        assert!(fields.contains(&(MESSAGE, STATEMENT_REDACTED.into())));
+        assert!(!fields.iter().any(|(field, _)| *field == DETAIL));
     }
 }

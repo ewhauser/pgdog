@@ -4,7 +4,7 @@ This document summarizes PgDog's plugin system: architecture, execution flow, in
 
 PgDog plugins are Rust shared libraries loaded at runtime. They can route queries, allow, rewrite or deny statements before PgDog parses them, mask columns of the results, redact the errors Postgres returns, and receive the database catalog. FFI is used for safe communication, with strict version checks for safety.
 
-This document describes plugin API 0.7 (`pgdog-plugin` 0.7). The hooks other than `route` are covered in [Hooks and capabilities](#hooks-and-capabilities).
+This document describes plugin API 0.8 (`pgdog-plugin` 0.8). The hooks other than `route` are covered in [Hooks and capabilities](#hooks-and-capabilities).
 
 ## Architecture
 
@@ -147,7 +147,7 @@ Hooks that run for a client get a [`Session`](../pgdog-plugin/src/session.rs): t
 The plugin with `STATEMENT` sees the SQL of every simple `Query` and extended protocol `Parse`, and returns a [`Verdict`](../pgdog-plugin/src/statement.rs):
 
 - `Verdict::Allow`: send the statement unchanged;
-- `Verdict::Rewrite { sql, columns }`: send `sql` instead, and mask `columns` of its results (see [Masks](#masks)). Everything downstream, including the prepared statements cache, the AST cache, the router and sharding, sees the new SQL;
+- `Verdict::Rewrite { sql, columns, redact_errors }`: send `sql` instead, mask `columns` of its results (see [Masks](#masks)), and, if `redact_errors` is set, redact the statement's errors (see [Statement errors](#statement-errors)). `sql` can be the original statement, to only mask or redact. Everything downstream, including the prepared statements cache, the AST cache, the router and sharding, sees the new SQL;
 - `Verdict::Deny(Deny { sqlstate, message })`: reject the statement with an `ErrorResponse`.
 
 Fast-path function calls carry no SQL, only the function's OID; `function_call` allows or denies them.
@@ -170,6 +170,8 @@ See [pgdog-plugin/src/statement.rs](../pgdog-plugin/src/statement.rs) and [pgdog
 
 A rewrite can name result columns to mask with [`ColumnMask`](../pgdog-plugin/src/statement.rs): a column position, which result set it's in (only multi-statement queries have more than one), a plugin-defined `MaskId`, the column's type OID, and whether the mask may block. Use masks for values computed in code rather than SQL, e.g. a keyed hash whose key must not appear in the statement, tokens from a vault, or noise added to a number. The plugin needs the `MASK` capability.
 
+`ColumnMask::null(column)` replaces a column's values with `NULL` without calling the plugin, whatever the column's type, e.g. for values computed from data the user can't see.
+
 Masks keep the column's type: they get values of the declared type and return values of the same type. Values are in the format the client asked for, text for simple queries and what the client's `Bind` requested for the extended protocol; each `MaskColumn` carries its format, and masks return values in it. `pgdog_plugin::types` decodes and encodes common types in both formats. The type OID is the one Postgres reports in `RowDescription` (the base type, for domains; the catalog's `Column::type_oid`). PgDog checks it when it sees the statement's `RowDescription`, and fails the statement if it differs.
 
 PgDog collects a statement's `DataRow`s in batches and calls `mask_rows` once per batch, with the values of the masked columns only, column by column. The plugin writes one value per input value into `MaskOutput`, in the same order. A batch is the rows already received from the server, up to 256 rows or 1 MiB, so batching never makes the client wait for rows that haven't arrived. Rows are forwarded in order, after multi-shard results have been merged, sorted and aggregated. Batches with a blocking mask run on Tokio's blocking thread pool.
@@ -190,6 +192,10 @@ Postgres errors can contain the data a statement touched: a unique violation's `
 The severity and SQLSTATE always reach the client unchanged, so clients keep handling errors correctly. A plugin that panics or returns invalid output fails closed: the error is reduced to its severity, SQLSTATE and a generic message.
 
 See [pgdog-plugin/src/redact.rs](../pgdog-plugin/src/redact.rs).
+
+### Statement errors
+
+A rewrite with `redact_errors` asks PgDog to replace the message of every `ErrorResponse` and `NoticeResponse` the statement causes with a fixed one, keeping the severity, SQLSTATE, and the position and location fields. It applies to what masks apply to: a `Query` until its `ReadyForQuery`, and a `Parse`, its `Describe`s and the portals bound to it. Use it for statements that compute on values the user can't see, whose errors could contain them. The plugin needs the `MASK` capability. Statement redaction runs after `redact_error`, replacing the message it returned.
 
 ### Concurrency
 

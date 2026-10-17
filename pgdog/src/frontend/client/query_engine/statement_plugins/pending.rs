@@ -17,8 +17,10 @@ pub(super) enum Pending {
         /// Result set being returned, counting from 0.
         result: u16,
     },
-    Parse,
-    Bind,
+    /// With the statement's plan, for its errors.
+    Parse(Option<Arc<Plan>>),
+    /// With the portal's plan, for its errors.
+    Bind(Option<Arc<Plan>>),
     DescribeStatement(Option<Arc<Plan>>),
     DescribePortal(Option<PortalPlan>),
     Execute(Option<PortalPlan>),
@@ -49,8 +51,8 @@ impl Pending {
             // only the one the client sees ends the query.
             (Self::Query { .. }, 'Z') if client_visible => Complete,
             (Self::Query { .. }, _) => Partial,
-            (Self::Parse, '1') => Complete,
-            (Self::Bind, '2') => Complete,
+            (Self::Parse(_), '1') => Complete,
+            (Self::Bind(_), '2') => Complete,
             (Self::DescribeStatement(_), 't') => Partial,
             (Self::DescribeStatement(_), 'T' | 'n') => Complete,
             (Self::DescribePortal(_), 'T' | 'n') => Complete,
@@ -80,7 +82,10 @@ impl Pending {
                 result: *result,
                 formats: None,
             }),
-            Self::DescribeStatement(Some(plan)) => Some(Masking {
+            // Parse and Bind only produce errors: their plan is for redacting them.
+            Self::Parse(Some(plan))
+            | Self::Bind(Some(plan))
+            | Self::DescribeStatement(Some(plan)) => Some(Masking {
                 plan: plan.clone(),
                 result: 0,
                 formats: None,
