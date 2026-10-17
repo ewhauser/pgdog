@@ -447,6 +447,62 @@ async fn test_masked_second_result() {
     assert_eq!(values(&messages), ["first", "SECOND"]);
 }
 
+/// Server connections can hold other clients' statements, e.g. under PgDog's
+/// global names; binding or describing a name this client never prepared would
+/// run them without the plugin's decision.
+#[tokio::test]
+async fn test_unprepared_statement_refused() {
+    let mut client = test_client().await;
+
+    // A transaction keeps the server connection, and the statement on it.
+    client.send_simple(Query::new("BEGIN")).await;
+    client.read_until('Z').await.unwrap();
+
+    // Prepared through PgDog: the plugin decided on it.
+    client
+        .send(Parse::named(
+            "known",
+            format!("SELECT 'value' /* {MASK} */"),
+        ))
+        .await;
+    client.send(Bind::new_statement("known")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(values(&messages), ["VALUE"]);
+
+    // The name PgDog gave it on the server.
+    client
+        .send_simple(Query::new(format!(
+            "SELECT name FROM pg_prepared_statements WHERE statement LIKE '%{MASK}%'"
+        )))
+        .await;
+    let messages = client.read_until('Z').await.unwrap();
+    let names = values(&messages);
+    assert_eq!(names.len(), 1, "{names:?}");
+    // The lookup's own text carries the marker, so the plugin upper-cased it.
+    let server_name = names[0].to_lowercase();
+
+    client.send(Bind::new_statement(&server_name)).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    // Without the check, the server runs it and the rows come back unmasked.
+    let error = client.read_until('Z').await.unwrap_err();
+    assert_eq!(error.code, "26000", "{error:?}");
+    expect_message!(client.read().await, ReadyForQuery);
+
+    for name in [server_name.as_str(), ""] {
+        client.send(Describe::new_statement(name)).await;
+        client.send(Sync).await;
+        client.try_process().await.unwrap();
+        let error = client.read_until('Z').await.unwrap_err();
+        assert_eq!(error.code, "26000", "describe {name:?}");
+        expect_message!(client.read().await, ReadyForQuery);
+    }
+}
+
 /// PgDog answers the SET of a split query itself, without the server's
 /// CommandComplete; the SELECT is still the query's second result.
 #[tokio::test]

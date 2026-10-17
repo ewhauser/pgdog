@@ -158,6 +158,7 @@ Verdicts must be deterministic: they depend only on the session and the SQL, unt
 
 - A statement is checked when it's prepared, and again at `Bind` only if the plugin's generation or the session's `search_path` changed since. `generation()` is called at every `Bind`, so it must be cheap.
 - If the new verdict sends different SQL (e.g., the plugin reloaded its configuration), PgDog prepares the statement again with the new SQL, so long-lived prepared statements follow plugin changes. If it can't (the unnamed statement, or prepared statements aren't handled by PgDog), the `Bind` fails with `26000` and the client must prepare the statement again.
+- A `Bind` or statement `Describe` naming a statement the client didn't prepare through PgDog is refused with `26000`: server connections hold statements under PgDog's own names, which would otherwise run without the plugin's decision.
 - A rewrite of a `Parse` must keep the statement's bind parameters: PgDog denies it (`XX000`) if its highest parameter number differs from the original's.
 
 In this version, at most one loaded plugin can have `STATEMENT`: a rewrite changes the columns another plugin's masks would refer to, so verdicts of several plugins aren't combined. A second one fails to load.

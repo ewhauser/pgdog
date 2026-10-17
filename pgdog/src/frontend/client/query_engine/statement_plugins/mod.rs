@@ -225,6 +225,13 @@ fn denied(sqlstate: &str, message: String) -> ErrorResponse {
     }
 }
 
+fn not_prepared(name: &str) -> ErrorResponse {
+    denied(
+        "26000",
+        format!("prepared statement \"{name}\" does not exist"),
+    )
+}
+
 fn out_of_date(name: &str) -> ErrorResponse {
     denied(
         "26000",
@@ -443,8 +450,12 @@ impl QueryEngine {
                             prepared.search_path = strings.search_path.to_string();
                         }
                         plan = prepared.decision.plan.clone();
+                    } else if context.prepared_statements.name(&name).is_none() {
+                        // Neither the plugin nor PgDog saw it prepared by this
+                        // client: a server connection may still hold someone
+                        // else's statement under that name.
+                        return Ok(Some(not_prepared(&name)));
                     }
-                    // Otherwise not prepared through us: let Postgres report the error.
 
                     staged.pending.push(Pending::Bind(plan.clone()));
                     let plan = plan.map(|plan| PortalPlan {
@@ -457,6 +468,11 @@ impl QueryEngine {
                 ProtocolMessage::Describe(describe) => {
                     let name = describe.statement();
                     let pending = if describe.is_statement() {
+                        if staged.prepared(&mut state.prepared, name).is_none()
+                            && context.prepared_statements.name(name).is_none()
+                        {
+                            return Ok(Some(not_prepared(name)));
+                        }
                         Pending::DescribeStatement(
                             staged
                                 .prepared(&mut state.prepared, name)
