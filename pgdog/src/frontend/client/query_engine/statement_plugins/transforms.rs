@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use pgdog_plugin::{ColumnMask, MaskBatch, MaskColumn, Value};
+use pgdog_plugin::{ColumnTransform, TransformBatch, TransformColumn, Value};
 
 use crate::net::{Format, FromBytes, Message, RowDescription};
 use crate::plugin::LoadedPlugin;
@@ -17,7 +17,7 @@ pub(super) const MAX_BATCH_BYTES: usize = 1024 * 1024;
 #[derive(Debug)]
 pub(super) struct Plan {
     pub(super) plugin: &'static LoadedPlugin,
-    pub(super) columns: Vec<ColumnMask>,
+    pub(super) columns: Vec<ColumnTransform>,
     /// Replace the messages of the statement's errors and notices.
     pub(super) redact_errors: bool,
 }
@@ -41,7 +41,7 @@ pub(crate) struct Masking {
 
 impl Masking {
     /// Masked columns of the current result set.
-    fn columns(&self) -> impl Iterator<Item = &ColumnMask> {
+    fn columns(&self) -> impl Iterator<Item = &ColumnTransform> {
         let result = self.result;
         self.plan
             .columns
@@ -77,11 +77,11 @@ impl Masking {
             let field = description
                 .fields
                 .get(mask.column as usize)
-                .ok_or_else(|| format!("masked column {} doesn't exist", mask.column))?;
+                .ok_or_else(|| format!("transformed column {} doesn't exist", mask.column))?;
             // NULL fits any type.
             if !mask.is_null() && field.type_oid as u32 != mask.type_oid {
                 return Err(format!(
-                    "masked column \"{}\" has type OID {}, the plugin expected {}",
+                    "transformed column \"{}\" has type OID {}, the plugin expected {}",
                     field.name, field.type_oid, mask.type_oid
                 ));
             }
@@ -92,7 +92,7 @@ impl Masking {
 
     /// Mask a batch of `DataRow`s in place.
     pub(super) fn mask(&self, rows: &mut [Message]) -> Result<(), String> {
-        let masks: Vec<&ColumnMask> = self.columns().collect();
+        let masks: Vec<&ColumnTransform> = self.columns().collect();
         if masks.is_empty() || rows.is_empty() {
             return Ok(());
         }
@@ -112,7 +112,7 @@ impl Masking {
         for (index, mask) in masks.iter().enumerate() {
             let slot = masked
                 .get_mut(mask.column as usize)
-                .ok_or_else(|| format!("masked column {} doesn't exist", mask.column))?;
+                .ok_or_else(|| format!("transformed column {} doesn't exist", mask.column))?;
             *slot = Some(index);
         }
         // Masked columns in row order, with the index of their mask.
@@ -123,7 +123,7 @@ impl Masking {
             .collect();
 
         // NULL masks are applied here; the plugin gets the other columns.
-        let plugin_masks: Vec<(usize, &ColumnMask)> = masks
+        let plugin_masks: Vec<(usize, &ColumnTransform)> = masks
             .iter()
             .enumerate()
             .filter(|(_, mask)| !mask.is_null())
@@ -147,20 +147,20 @@ impl Masking {
                     .collect()
             })
             .collect();
-        let columns: Vec<MaskColumn<'_>> = plugin_masks
+        let columns: Vec<TransformColumn<'_>> = plugin_masks
             .iter()
             .zip(&values)
-            .map(|((_, mask), values)| MaskColumn::new(mask, self.format(mask.column), values))
+            .map(|((_, mask), values)| TransformColumn::new(mask, self.format(mask.column), values))
             .collect();
         let output = if columns.is_empty() {
             None
         } else {
-            let batch = MaskBatch::new(rows.len() as u32, &columns);
+            let batch = TransformBatch::new(rows.len() as u32, &columns);
             Some(
                 self.plan
                     .plugin
                     .vtable()
-                    .mask_rows(&batch)
+                    .transform_rows(&batch)
                     .map_err(|err| err.to_string())?,
             )
         };
@@ -255,7 +255,7 @@ mod test {
         assert!(parse_row(&payload[..payload.len() - 2], &mut Vec::new()).is_none());
     }
 
-    fn masking(columns: Vec<ColumnMask>) -> Masking {
+    fn masking(columns: Vec<ColumnTransform>) -> Masking {
         Masking {
             plan: Arc::new(Plan {
                 plugin: test_plugin(),
@@ -279,8 +279,8 @@ mod test {
     fn test_mask_rows() {
         let digest = std::str::from_utf8(&DIGEST_VALUE).unwrap();
         let masking = masking(vec![
-            ColumnMask::new(0, DIGEST, 25),
-            ColumnMask::new(2, UPPERCASE, 25),
+            ColumnTransform::new(0, DIGEST, 25),
+            ColumnTransform::new(2, UPPERCASE, 25),
         ]);
         let mut rows = vec![
             data_row(&[Some("123-45-6789"), Some("kept"), Some("abc")]),
@@ -302,7 +302,7 @@ mod test {
 
     #[test]
     fn test_mask_rows_errors() {
-        let masking = masking(vec![ColumnMask::new(0, DIGEST, 25)]);
+        let masking = masking(vec![ColumnTransform::new(0, DIGEST, 25)]);
 
         let mut rows = vec![data_row(&[Some("a")]), data_row(&[Some("a"), Some("b")])];
         assert!(masking.mask(&mut rows).is_err());
@@ -310,7 +310,7 @@ mod test {
         let mut rows = vec![Message::new(Bytes::from_static(b"D\0\0\0\x06\0\x01"))];
         assert!(masking.mask(&mut rows).is_err());
 
-        let masking = self::masking(vec![ColumnMask::new(3, DIGEST, 25)]);
+        let masking = self::masking(vec![ColumnTransform::new(3, DIGEST, 25)]);
         let mut rows = vec![data_row(&[Some("a")])];
         assert!(masking.mask(&mut rows).is_err());
     }
@@ -323,7 +323,7 @@ mod test {
         use std::time::Instant;
 
         const ITERATIONS: usize = 20_000;
-        let masking = masking(vec![ColumnMask::new(1, DIGEST, 25)]);
+        let masking = masking(vec![ColumnTransform::new(1, DIGEST, 25)]);
         let rows: Vec<Message> = (0..MAX_BATCH_ROWS)
             .map(|i| {
                 let id = i.to_string();

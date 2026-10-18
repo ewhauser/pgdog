@@ -13,10 +13,13 @@ use std::{
 use crate::{
     Access, Capabilities, Catalog, CatalogParts, Config, Context, PdStr, Route, Session, Verdict,
     catalog,
-    mask::{MASK_ERROR, MASK_OK, MASK_PANIC, MaskBatch, MaskError, MaskOutput, MaskResult},
     parameters::{Parameters, RawParameters},
     redact::{ErrorFields, REDACT_KEEP, REDACT_PANIC, REDACT_REPLACE, Redaction, RedactionOutput},
     statement::{VERDICT_ALLOW, VERDICT_DENY, VERDICT_PANIC, VERDICT_REWRITE, VerdictOutput},
+    transform::{
+        TRANSFORM_ERROR, TRANSFORM_OK, TRANSFORM_PANIC, TransformBatch, TransformError,
+        TransformOutput, TransformResult,
+    },
 };
 use libloading::{Library, Symbol, library_filename};
 
@@ -66,10 +69,10 @@ pub struct PluginVtable {
     free_verdict: extern "C-unwind" fn(&mut VerdictOutput),
     /// Generation of the plugin's verdicts.
     generation: extern "C-unwind" fn() -> u64,
-    /// Mask a batch of rows.
-    mask_rows: extern "C-unwind" fn(&MaskBatch<'_>) -> MaskResult,
-    /// Free the output of `mask_rows`.
-    free_mask_result: extern "C-unwind" fn(&mut MaskResult),
+    /// Transform a batch of rows.
+    transform_rows: extern "C-unwind" fn(&TransformBatch<'_>) -> TransformResult,
+    /// Free the output of `transform_rows`.
+    free_transform_result: extern "C-unwind" fn(&mut TransformResult),
     /// Redact an error or notice.
     redact_error: extern "C-unwind" fn(&Session<'_>, &ErrorFields<'_>) -> RedactionOutput,
     /// Free the output of `redact_error`.
@@ -118,14 +121,14 @@ impl std::error::Error for HookError {}
 /// # Concurrency
 ///
 /// PgDog serves clients on many threads and calls hooks from all of them at
-/// once. For one client, `statement`, `function_call`, `mask_rows` and
+/// once. For one client, `statement`, `function_call`, `transform_rows` and
 /// `redact_error` are called one at a time, in the order of the client's
 /// messages and the server's responses. `catalog` and `reload` can run at any
 /// time, concurrently with the other hooks.
 ///
 /// Plugins must make their own state safe to share across threads. Hooks run
-/// on PgDog's async workers, so they must not block, except `mask_rows` for
-/// masks declared blocking with [`crate::ColumnMask::blocking`].
+/// on PgDog's async workers, so they must not block, except `transform_rows` for
+/// transforms declared blocking with [`crate::ColumnTransform::blocking`].
 ///
 /// # Panics
 ///
@@ -262,25 +265,28 @@ pub trait Plugin {
         catch_unwind(Self::generation).unwrap_or(u64::MAX)
     }
 
-    /// Mask a batch of result rows. Write exactly one value into `out` for
-    /// each value in `batch`, column by column. Requires [`Capabilities::MASK`].
-    /// See [`crate::mask`].
-    fn mask_rows(_batch: &MaskBatch<'_>, _out: &mut MaskOutput) -> Result<(), MaskError> {
-        Err(MaskError::new("mask_rows isn't implemented"))
+    /// Transform a batch of result rows. Write exactly one value into `out` for
+    /// each value in `batch`, column by column. Requires [`Capabilities::TRANSFORM`].
+    /// See [`crate::transform`].
+    fn transform_rows(
+        _batch: &TransformBatch<'_>,
+        _out: &mut TransformOutput,
+    ) -> Result<(), TransformError> {
+        Err(TransformError::new("transform_rows isn't implemented"))
     }
 
     #[doc(hidden)]
-    extern "C-unwind" fn mask_rows_raw(batch: &MaskBatch<'_>) -> MaskResult {
+    extern "C-unwind" fn transform_rows_raw(batch: &TransformBatch<'_>) -> TransformResult {
         catch_unwind(AssertUnwindSafe(|| {
             let values = batch.columns().len() * batch.rows as usize;
-            let mut out = MaskOutput::with_capacity(values, values * 16);
-            Self::mask_rows(batch, &mut out).map(|_| out).into()
+            let mut out = TransformOutput::with_capacity(values, values * 16);
+            Self::transform_rows(batch, &mut out).map(|_| out).into()
         }))
-        .unwrap_or_else(|_| MaskResult::panicked())
+        .unwrap_or_else(|_| TransformResult::panicked())
     }
 
     #[doc(hidden)]
-    extern "C-unwind" fn free_mask_result(output: &mut MaskResult) {
+    extern "C-unwind" fn free_transform_result(output: &mut TransformResult) {
         output.free()
     }
 
@@ -347,15 +353,15 @@ pub trait Plugin {
     }
 }
 
-/// Masked values of a batch, borrowed from the plugin until dropped.
-pub struct MaskedValues<'a> {
+/// Transformed values of a batch, borrowed from the plugin until dropped.
+pub struct TransformedValues<'a> {
     vtable: &'a PluginVtable,
-    result: MaskResult,
+    result: TransformResult,
     /// Start of each value in `result.data()`.
     offsets: Vec<usize>,
 }
 
-impl MaskedValues<'_> {
+impl TransformedValues<'_> {
     /// The value at `index`, column by column. `None` is NULL.
     pub fn get(&self, index: usize) -> Option<&[u8]> {
         let len = *self.result.lengths().get(index)?;
@@ -374,13 +380,13 @@ impl MaskedValues<'_> {
     }
 }
 
-impl Drop for MaskedValues<'_> {
+impl Drop for TransformedValues<'_> {
     fn drop(&mut self) {
-        (self.vtable.free_mask_result)(&mut self.result)
+        (self.vtable.free_transform_result)(&mut self.result)
     }
 }
 
-impl fmt::Debug for MaskedValues<'_> {
+impl fmt::Debug for TransformedValues<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list()
             .entries((0..self.len()).map(|index| self.get(index)))
@@ -405,8 +411,8 @@ impl PluginVtable {
             function_call: T::function_call_raw,
             free_verdict: T::free_verdict,
             generation: T::generation_raw,
-            mask_rows: T::mask_rows_raw,
-            free_mask_result: T::free_mask_result,
+            transform_rows: T::transform_rows_raw,
+            free_transform_result: T::free_transform_result,
             redact_error: T::redact_error_raw,
             free_redaction: T::free_redaction,
             catalog_parts: T::catalog_parts_raw,
@@ -545,28 +551,31 @@ impl PluginVtable {
         (self.generation)()
     }
 
-    /// Run the mask hook. The masked values stay in plugin memory until the
-    /// returned [`MaskedValues`] is dropped.
-    pub fn mask_rows(&self, batch: &MaskBatch<'_>) -> Result<MaskedValues<'_>, HookError> {
-        let result = (self.mask_rows)(batch);
-        let mut values = MaskedValues {
+    /// Run the transform hook. The transformed values stay in plugin memory until the
+    /// returned [`TransformedValues`] is dropped.
+    pub fn transform_rows(
+        &self,
+        batch: &TransformBatch<'_>,
+    ) -> Result<TransformedValues<'_>, HookError> {
+        let result = (self.transform_rows)(batch);
+        let mut values = TransformedValues {
             vtable: self,
             result,
             offsets: vec![],
         };
 
         match values.result.status() {
-            MASK_OK => (),
-            MASK_ERROR => return Err(HookError::Failed(values.result.message())),
-            MASK_PANIC => return Err(HookError::Panicked),
-            _ => return Err(HookError::InvalidOutput("unknown mask status")),
+            TRANSFORM_OK => (),
+            TRANSFORM_ERROR => return Err(HookError::Failed(values.result.message())),
+            TRANSFORM_PANIC => return Err(HookError::Panicked),
+            _ => return Err(HookError::InvalidOutput("unknown transform status")),
         }
 
         let expected = batch.columns().len() * batch.rows as usize;
         let lengths = values.result.lengths();
         if lengths.len() != expected {
             return Err(HookError::InvalidOutput(
-                "mask_rows didn't return one value per input value",
+                "transform_rows didn't return one value per input value",
             ));
         }
 
@@ -577,7 +586,9 @@ impl PluginVtable {
             offset += (*len).max(0) as usize;
         }
         if offset != values.result.data().len() {
-            return Err(HookError::InvalidOutput("mask_rows output is inconsistent"));
+            return Err(HookError::InvalidOutput(
+                "transform_rows output is inconsistent",
+            ));
         }
         values.offsets = offsets;
 
@@ -624,7 +635,7 @@ impl PluginVtable {
 mod test {
     use super::*;
     use crate::{
-        ColumnMask, Deny, MaskColumn, MaskId, SqlState, Value,
+        ColumnTransform, Deny, SqlState, TransformColumn, TransformId, Value,
         redact::{ErrorField, field},
     };
 
@@ -636,17 +647,18 @@ mod test {
         }
 
         fn capabilities() -> Capabilities {
-            Capabilities::STATEMENT | Capabilities::MASK | Capabilities::ERRORS
+            Capabilities::STATEMENT | Capabilities::TRANSFORM | Capabilities::ERRORS
         }
 
         fn statement(session: &Session<'_>, sql: &str) -> Verdict {
             match sql {
                 "panic" => panic!("statement hook panicked"),
                 "deny" => Verdict::Deny(Deny::insufficient_privilege("denied")),
-                "mask" => {
-                    Verdict::rewrite_masked("SELECT 1", vec![ColumnMask::new(1, MaskId(9), 25)])
-                        .redact_errors(true)
-                }
+                "mask" => Verdict::transform(
+                    "SELECT 1",
+                    vec![ColumnTransform::new(1, TransformId(9), 25)],
+                )
+                .redact_errors(true),
                 sql => Verdict::rewrite(format!("{sql} /* {} */", &*session.user)),
             }
         }
@@ -662,12 +674,15 @@ mod test {
             7
         }
 
-        fn mask_rows(batch: &MaskBatch<'_>, out: &mut MaskOutput) -> Result<(), MaskError> {
+        fn transform_rows(
+            batch: &TransformBatch<'_>,
+            out: &mut TransformOutput,
+        ) -> Result<(), TransformError> {
             for column in batch.columns() {
                 for value in column.values() {
                     match value {
                         Some(b"panic") => panic!("mask hook panicked"),
-                        Some(b"fail") => return Err(MaskError::new("can't mask")),
+                        Some(b"fail") => return Err(TransformError::new("can't mask")),
                         Some(b"short") => return Ok(()),
                         Some(value) => out.push(Some(&value.to_ascii_uppercase())),
                         None => out.push(None),
@@ -694,14 +709,14 @@ mod test {
 
     fn mask(values: &[Option<&[u8]>]) -> Result<Vec<Option<Vec<u8>>>, HookError> {
         let values: Vec<_> = values.iter().map(|value| Value::new(*value)).collect();
-        let mask = ColumnMask::new(0, MaskId(1), 25);
-        let columns = [MaskColumn::new(
+        let mask = ColumnTransform::new(0, TransformId(1), 25);
+        let columns = [TransformColumn::new(
             &mask,
             crate::ParameterFormat::Text,
             &values,
         )];
-        let batch = MaskBatch::new(values.len() as u32, &columns);
-        let masked = VTABLE.mask_rows(&batch)?;
+        let batch = TransformBatch::new(values.len() as u32, &columns);
+        let masked = VTABLE.transform_rows(&batch)?;
         Ok((0..masked.len())
             .map(|index| masked.get(index).map(|value| value.to_vec()))
             .collect())
@@ -711,7 +726,7 @@ mod test {
     fn test_capabilities() {
         assert_eq!(
             VTABLE.capabilities(),
-            Capabilities::STATEMENT | Capabilities::MASK | Capabilities::ERRORS
+            Capabilities::STATEMENT | Capabilities::TRANSFORM | Capabilities::ERRORS
         );
         assert_eq!(VTABLE.generation(), 7);
         assert_eq!(VTABLE.catalog_parts(), CatalogParts::NONE);
@@ -730,8 +745,11 @@ mod test {
         );
         assert_eq!(
             VTABLE.statement(&session, "mask").unwrap(),
-            Verdict::rewrite_masked("SELECT 1", vec![ColumnMask::new(1, MaskId(9), 25)])
-                .redact_errors(true)
+            Verdict::transform(
+                "SELECT 1",
+                vec![ColumnTransform::new(1, TransformId(9), 25)]
+            )
+            .redact_errors(true)
         );
         assert_eq!(
             VTABLE.statement(&session, "panic"),

@@ -7,8 +7,8 @@
 //! rewrote. The plugin returns a [`Verdict`]:
 //!
 //! - [`Verdict::Allow`]: send the statement unchanged;
-//! - [`Verdict::Rewrite`]: send different SQL instead, optionally masking some
-//!   of its result columns with [`crate::Plugin::mask_rows`]. Everything
+//! - [`Verdict::Rewrite`]: send different SQL instead, optionally transforming
+//!   some of its result columns with [`crate::Plugin::transform_rows`]. Everything
 //!   downstream in PgDog, including sharding, sees the new SQL;
 //! - [`Verdict::Deny`]: return an error to the client.
 //!
@@ -112,30 +112,30 @@ impl Deny {
     }
 }
 
-/// Identifies one of the plugin's masks. Its meaning is up to the plugin,
-/// except for [`MaskId::NULL`].
+/// Identifies one of the plugin's column transforms. Its meaning is up to the
+/// plugin, except for [`TransformId::NULL`].
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct MaskId(pub u64);
+pub struct TransformId(pub u64);
 
-impl MaskId {
+impl TransformId {
     /// Replace the column's values with NULL. PgDog applies it itself, without
-    /// calling [`crate::Plugin::mask_rows`], to a column of any type.
+    /// calling [`crate::Plugin::transform_rows`], to a column of any type.
     pub const NULL: Self = Self(u64::MAX);
 }
 
-/// A result column PgDog passes to [`crate::Plugin::mask_rows`].
+/// A result column PgDog passes to [`crate::Plugin::transform_rows`].
 ///
 /// `type_oid` is the column's type in the rewritten statement, as Postgres
-/// reports it in `RowDescription` (the base type, for domains). Masks receive
-/// values of that type and must return values of the same type, in the format
-/// the client asked for (see [`crate::MaskColumn::format`]). PgDog checks the
+/// reports it in `RowDescription` (the base type, for domains). Transforms
+/// receive values of that type and must return values of the same type, in the format
+/// the client asked for (see [`crate::TransformColumn::format`]). PgDog checks the
 /// type when it sees the statement's `RowDescription`, and fails the statement
 /// if it differs.
 #[non_exhaustive]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ColumnMask {
+pub struct ColumnTransform {
     /// Which result set of the statement, counting from 0. Only simple queries
     /// with several statements have more than one: it's the statement's
     /// position in the (rewritten) query, counting every statement, including
@@ -143,22 +143,22 @@ pub struct ColumnMask {
     pub result: u16,
     /// Column position in the result set, counting from 0.
     pub column: u16,
-    /// Mask to apply.
-    pub mask: MaskId,
+    /// Transform to apply.
+    pub transform: TransformId,
     /// Type OID of the column.
     pub type_oid: u32,
-    /// The mask may block, e.g. on a network call. PgDog runs batches with a
-    /// blocking mask on a thread pool for blocking work.
+    /// The transform may block, e.g. on a network call. PgDog runs batches with
+    /// a blocking transform on a thread pool for blocking work.
     pub blocking: bool,
 }
 
-impl ColumnMask {
-    /// Mask a column of type `type_oid` in the first result set.
-    pub fn new(column: u16, mask: MaskId, type_oid: u32) -> Self {
+impl ColumnTransform {
+    /// Transform a column of type `type_oid` in the first result set.
+    pub fn new(column: u16, transform: TransformId, type_oid: u32) -> Self {
         Self {
             result: 0,
             column,
-            mask,
+            transform,
             type_oid,
             blocking: false,
         }
@@ -170,7 +170,7 @@ impl ColumnMask {
         Self {
             result: 0,
             column,
-            mask: MaskId::NULL,
+            transform: TransformId::NULL,
             type_oid: 0,
             blocking: false,
         }
@@ -178,16 +178,16 @@ impl ColumnMask {
 
     /// This column is replaced with NULL by PgDog.
     pub fn is_null(&self) -> bool {
-        self.mask == MaskId::NULL
+        self.transform == TransformId::NULL
     }
 
-    /// Mask a column of a later result set of a multi-statement query.
+    /// Transform a column of a later result set of a multi-statement query.
     pub fn in_result(mut self, result: u16) -> Self {
         self.result = result;
         self
     }
 
-    /// The mask may block.
+    /// The transform may block.
     pub fn blocking(mut self) -> Self {
         self.blocking = true;
         self
@@ -200,18 +200,18 @@ impl ColumnMask {
 pub enum Verdict {
     /// Send the statement unchanged.
     Allow,
-    /// Send `sql` instead, and mask `columns` of its results.
+    /// Send `sql` instead, and transform `columns` of its results.
     #[non_exhaustive]
     Rewrite {
-        /// Replacement SQL. May be the original SQL, to only mask columns.
+        /// Replacement SQL. May be the original SQL, to only transform columns.
         sql: String,
-        /// Result columns to pass to [`crate::Plugin::mask_rows`], or to replace
-        /// with NULL. Requires [`crate::Capabilities::MASK`].
-        columns: Vec<ColumnMask>,
+        /// Result columns to pass to [`crate::Plugin::transform_rows`], or to replace
+        /// with NULL. Requires [`crate::Capabilities::TRANSFORM`].
+        columns: Vec<ColumnTransform>,
         /// Replace the message of the statement's errors and notices with a
         /// generic one, keeping their severity, SQLSTATE and position. For
         /// statements that compute with values the client mustn't see, whose
-        /// errors could quote them. Requires [`crate::Capabilities::MASK`].
+        /// errors could quote them. Requires [`crate::Capabilities::TRANSFORM`].
         redact_errors: bool,
     },
     /// Return an error to the client.
@@ -219,14 +219,14 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    /// Send `sql` instead, without masking any columns.
+    /// Send `sql` instead, without transforming any columns.
     pub fn rewrite(sql: impl Into<String>) -> Self {
-        Self::rewrite_masked(sql, vec![])
+        Self::transform(sql, vec![])
     }
 
-    /// Send `sql` instead, and mask `columns` of its results. `sql` may be the
-    /// original SQL, to only mask columns.
-    pub fn rewrite_masked(sql: impl Into<String>, columns: Vec<ColumnMask>) -> Self {
+    /// Send `sql` instead, and transform `columns` of its results. `sql` may be
+    /// the original SQL, to only transform columns.
+    pub fn transform(sql: impl Into<String>, columns: Vec<ColumnTransform>) -> Self {
         Self::Rewrite {
             sql: sql.into(),
             columns,
@@ -269,7 +269,7 @@ pub(crate) const VERDICT_PANIC: u8 = 3;
 pub struct VerdictOutput {
     action: u8,
     sql: PdBuf,
-    columns: PdVec<ColumnMask>,
+    columns: PdVec<ColumnTransform>,
     redact_errors: bool,
     sqlstate: SqlState,
     message: PdBuf,
@@ -318,7 +318,7 @@ impl VerdictOutput {
         &self.sql
     }
 
-    pub(crate) fn columns(&self) -> &[ColumnMask] {
+    pub(crate) fn columns(&self) -> &[ColumnTransform] {
         self.columns.as_slice()
     }
 
@@ -380,11 +380,11 @@ mod test {
 
     #[test]
     fn test_verdict_output() {
-        let verdict = Verdict::rewrite_masked(
+        let verdict = Verdict::transform(
             "SELECT 1",
             vec![
-                ColumnMask::new(2, MaskId(7), 25).blocking(),
-                ColumnMask::null(3),
+                ColumnTransform::new(2, TransformId(7), 25).blocking(),
+                ColumnTransform::null(3),
             ],
         )
         .redact_errors(true);
@@ -393,8 +393,8 @@ mod test {
             Verdict::Rewrite {
                 sql: "SELECT 1".into(),
                 columns: vec![
-                    ColumnMask::new(2, MaskId(7), 25).blocking(),
-                    ColumnMask::null(3),
+                    ColumnTransform::new(2, TransformId(7), 25).blocking(),
+                    ColumnTransform::null(3),
                 ],
                 redact_errors: true,
             }
@@ -406,8 +406,8 @@ mod test {
         assert_eq!(
             output.columns(),
             &[
-                ColumnMask::new(2, MaskId(7), 25).blocking(),
-                ColumnMask::null(3)
+                ColumnTransform::new(2, TransformId(7), 25).blocking(),
+                ColumnTransform::null(3)
             ]
         );
         assert!(output.redact_errors());

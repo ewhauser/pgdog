@@ -182,7 +182,6 @@ mod config;
 pub mod context;
 pub mod logging;
 pub mod macros;
-pub mod mask;
 pub mod parameters;
 pub mod plugin;
 pub mod prelude;
@@ -190,22 +189,23 @@ pub mod redact;
 pub mod session;
 pub mod statement;
 pub mod string;
+pub mod transform;
 
 pub use buffer::{PdBuf, PdSlice, PdVec};
 pub use capabilities::Capabilities;
 pub use catalog::{Catalog, CatalogParts};
 pub use config::Config;
 pub use context::*;
-pub use mask::{MaskBatch, MaskColumn, MaskError, MaskOutput, Value};
 pub use parameters::*;
-/// Decode and encode Postgres values in text and binary formats, for masks.
+/// Decode and encode Postgres values in text and binary formats, for transforms.
 pub use pgdog_postgres_types as types;
 pub use pgdog_postgres_types::Format as ParameterFormat;
 pub use plugin::*;
 pub use redact::{ErrorField, ErrorFields, Redaction};
 pub use session::{ClientInfo, Session};
-pub use statement::{Access, ColumnMask, Deny, MaskId, SqlState, Verdict};
+pub use statement::{Access, ColumnTransform, Deny, SqlState, TransformId, Verdict};
 pub use string::PdStr;
+pub use transform::{TransformBatch, TransformColumn, TransformError, TransformOutput, Value};
 
 pub use libloading;
 

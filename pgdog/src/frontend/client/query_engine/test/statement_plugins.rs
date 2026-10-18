@@ -359,7 +359,7 @@ async fn test_simple_query_masked() {
 
     client
         .send_simple(Query::new(format!(
-            "SELECT 'secret' AS v, '{MASK}' AS marker"
+            "SELECT 'secret' AS v, '{TRANSFORM}' AS marker"
         )))
         .await;
     let messages = client.read_until('Z').await.unwrap();
@@ -371,7 +371,7 @@ async fn test_simple_query_masked() {
     let row = DataRow::try_from(row.clone()).unwrap();
     assert_eq!(row.get::<String>(0, Format::Text).unwrap(), "SECRET");
     // Only the masked column changes.
-    assert_eq!(row.get::<String>(1, Format::Text).unwrap(), MASK);
+    assert_eq!(row.get::<String>(1, Format::Text).unwrap(), TRANSFORM);
 
     // Masks are per statement.
     client.send_simple(Query::new("SELECT 'plain'")).await;
@@ -386,7 +386,7 @@ async fn test_extended_masked() {
     client
         .send(Parse::named(
             "masked",
-            format!("SELECT 'secret' AS v, NULL::text AS n, '{MASK}' AS marker"),
+            format!("SELECT 'secret' AS v, NULL::text AS n, '{TRANSFORM}' AS marker"),
         ))
         .await;
     client.send(Bind::new_statement("masked")).await;
@@ -412,7 +412,7 @@ async fn test_extended_masked() {
 /// Large results are masked in batches, in order.
 #[tokio::test]
 async fn test_masked_in_batches() {
-    for marker in [MASK, MASK_BLOCKING] {
+    for marker in [TRANSFORM, MASK_BLOCKING] {
         let mut client = test_client().await;
         let batches = MASK_BATCHES.load(Ordering::Relaxed);
 
@@ -462,7 +462,7 @@ async fn test_unprepared_statement_refused() {
     client
         .send(Parse::named(
             "known",
-            format!("SELECT 'value' /* {MASK} */"),
+            format!("SELECT 'value' /* {TRANSFORM} */"),
         ))
         .await;
     client.send(Bind::new_statement("known")).await;
@@ -475,7 +475,7 @@ async fn test_unprepared_statement_refused() {
     // The name PgDog gave it on the server.
     client
         .send_simple(Query::new(format!(
-            "SELECT name FROM pg_prepared_statements WHERE statement LIKE '%{MASK}%'"
+            "SELECT name FROM pg_prepared_statements WHERE statement LIKE '%{TRANSFORM}%'"
         )))
         .await;
     let messages = client.read_until('Z').await.unwrap();
@@ -542,7 +542,10 @@ async fn test_mask_failure_closes_connection() {
 async fn test_masked_column_type_checked() {
     let mut client = test_client().await;
     client
-        .send(Parse::named("not_text", format!("SELECT 1 /* {MASK} */")))
+        .send(Parse::named(
+            "not_text",
+            format!("SELECT 1 /* {TRANSFORM} */"),
+        ))
         .await;
     client.send(Describe::new_statement("not_text")).await;
     client.send(Sync).await;
@@ -599,7 +602,7 @@ async fn test_resumed_portal_keeps_masks() {
     client
         .send(Parse::named(
             "rows",
-            format!("SELECT 'secret', '{MASK}' FROM generate_series(1, 2)"),
+            format!("SELECT 'secret', '{TRANSFORM}' FROM generate_series(1, 2)"),
         ))
         .await;
     client
@@ -638,7 +641,7 @@ async fn test_close_after_execute_keeps_masks() {
     client
         .send(Parse::named(
             "closing",
-            format!("SELECT 'secret', '{MASK}'"),
+            format!("SELECT 'secret', '{TRANSFORM}'"),
         ))
         .await;
     client

@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::FutureExt;
-use pgdog_plugin::{Access, Capabilities, ClientInfo, ColumnMask, Session, Verdict};
+use pgdog_plugin::{Access, Capabilities, ClientInfo, ColumnTransform, Session, Verdict};
 use tracing::error;
 
 use super::*;
@@ -36,13 +36,13 @@ use crate::parameters::ParameterStore;
 use crate::plugin::{LoadedPlugin, has_capability, with_capability};
 
 mod errors;
-mod masks;
 mod params;
 mod pending;
+mod transforms;
 
-use masks::{MAX_BATCH_BYTES, MAX_BATCH_ROWS, Masking, Plan, PortalPlan};
 use params::max_parameter;
 use pending::{Pending, PendingQueue};
+use transforms::{MAX_BATCH_BYTES, MAX_BATCH_ROWS, Masking, Plan, PortalPlan};
 
 /// Who the client authenticated as. Captured when the connection is set up:
 /// `user` and `database` are session parameters clients can `SET`, so they
@@ -267,9 +267,10 @@ fn decide(
             redact_errors,
             ..
         }) => {
-            if (!columns.is_empty() || redact_errors) && !plugin.has(Capabilities::MASK) {
+            if (!columns.is_empty() || redact_errors) && !plugin.has(Capabilities::TRANSFORM) {
                 return Err(failed(
-                    "masked columns or redacted errors without the MASK capability".into(),
+                    "transformed columns or redacted errors without the TRANSFORM capability"
+                        .into(),
                 ));
             }
             // The client binds parameters for the statement it prepared.
@@ -293,7 +294,7 @@ fn decide(
 
 fn plan(
     plugin: &'static LoadedPlugin,
-    columns: Vec<ColumnMask>,
+    columns: Vec<ColumnTransform>,
     redact_errors: bool,
 ) -> Option<Arc<Plan>> {
     (!columns.is_empty() || redact_errors).then(|| {
@@ -355,7 +356,7 @@ impl QueryEngine {
             self.statement_plugins.pending.clear();
         }
 
-        let track = has_capability(Capabilities::MASK);
+        let track = has_capability(Capabilities::TRANSFORM);
         let mut generation = None;
         let state = &mut self.statement_plugins;
         state.read_connection(context);
@@ -638,7 +639,7 @@ impl QueryEngine {
             errors::redact(&strings.session(), message);
         }
 
-        if !has_capability(Capabilities::MASK) {
+        if !has_capability(Capabilities::TRANSFORM) {
             return Ok(None);
         }
 
@@ -706,7 +707,7 @@ impl QueryEngine {
                 result.map(|_| rows)
             })
             .await
-            .unwrap_or_else(|err| Err(format!("mask task failed: {err}")))
+            .unwrap_or_else(|err| Err(format!("transform task failed: {err}")))
         } else {
             masking.mask(&mut rows).map(|_| rows)
         };
@@ -734,10 +735,10 @@ impl QueryEngine {
         reason: &str,
     ) -> Error {
         let name = masking.plan.plugin.name();
-        error!("plugin \"{name}\" failed to mask results, closing connection: {reason}");
+        error!("plugin \"{name}\" failed to transform results, closing connection: {reason}");
 
         if let Err(err) = self.backend.cancel_query().await {
-            error!("failed to cancel query after plugin mask failure: {err}");
+            error!("failed to cancel query after plugin transform failure: {err}");
         }
         self.backend.force_close();
         let fatal = ErrorResponse {

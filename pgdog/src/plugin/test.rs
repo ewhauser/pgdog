@@ -6,8 +6,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pgdog_plugin::{
-    Capabilities, ColumnMask, Deny, ErrorFields, MaskBatch, MaskError, MaskId, MaskOutput, PdStr,
-    Plugin, PluginVtable, Redaction, Session, Verdict,
+    Capabilities, ColumnTransform, Deny, ErrorFields, PdStr, Plugin, PluginVtable, Redaction,
+    Session, TransformBatch, TransformError, TransformId, TransformOutput, Verdict,
     types::{DataType, Datum},
 };
 
@@ -27,10 +27,10 @@ pub(crate) const MASK_NULL: &str = "pgdog_test_null_mask";
 /// Errors and notices of these statements are redacted.
 pub(crate) const REDACT_ERRORS: &str = "pgdog_test_redact_errors";
 /// The first column of these statements, text, is uppercased by the plugin.
-pub(crate) const MASK: &str = "pgdog_test_mask";
+pub(crate) const TRANSFORM: &str = "pgdog_test_mask";
 /// The first column of these statements, an integer, is incremented by the plugin.
 pub(crate) const MASK_INT: &str = "pgdog_test_int_mask";
-/// Like [`MASK`], with a blocking mask.
+/// Like [`TRANSFORM`], with a blocking mask.
 pub(crate) const MASK_BLOCKING: &str = "pgdog_test_slow_mask";
 /// The first column of the second result set is uppercased.
 pub(crate) const MASK_SECOND: &str = "pgdog_test_second_mask";
@@ -52,11 +52,11 @@ pub(crate) static VERSIONED_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Number of batches masked.
 pub(crate) static MASK_BATCHES: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) const UPPERCASE: MaskId = MaskId(1);
-const FAIL: MaskId = MaskId(2);
-const INCREMENT: MaskId = MaskId(3);
+pub(crate) const UPPERCASE: TransformId = TransformId(1);
+const FAIL: TransformId = TransformId(2);
+const INCREMENT: TransformId = TransformId(3);
 /// Replaces text with 64 bytes, like a hex digest: longer than most values.
-pub(crate) const DIGEST: MaskId = MaskId(4);
+pub(crate) const DIGEST: TransformId = TransformId(4);
 /// What [`DIGEST`] masks values to.
 pub(crate) const DIGEST_VALUE: [u8; 64] = [b'f'; 64];
 
@@ -71,11 +71,11 @@ impl Plugin for TestPlugin {
     }
 
     fn capabilities() -> Capabilities {
-        Capabilities::STATEMENT | Capabilities::MASK | Capabilities::ERRORS
+        Capabilities::STATEMENT | Capabilities::TRANSFORM | Capabilities::ERRORS
     }
 
     fn statement(session: &Session<'_>, sql: &str) -> Verdict {
-        let mask = |mask: ColumnMask| Verdict::rewrite_masked(sql, vec![mask]);
+        let mask = |mask: ColumnTransform| Verdict::transform(sql, vec![mask]);
 
         if sql.contains(BLOCK) {
             Verdict::Deny(Deny::insufficient_privilege(format!(
@@ -84,22 +84,25 @@ impl Plugin for TestPlugin {
             )))
         } else if sql.contains(MASK_NULL) {
             // The second column through the plugin, the first replaced with NULL.
-            Verdict::rewrite_masked(
+            Verdict::transform(
                 sql,
-                vec![ColumnMask::null(0), ColumnMask::new(1, UPPERCASE, TEXT)],
+                vec![
+                    ColumnTransform::null(0),
+                    ColumnTransform::new(1, UPPERCASE, TEXT),
+                ],
             )
         } else if sql.contains(REDACT_ERRORS) {
             Verdict::rewrite(sql).redact_errors(true)
         } else if sql.contains(MASK_FAIL) {
-            mask(ColumnMask::new(0, FAIL, TEXT))
+            mask(ColumnTransform::new(0, FAIL, TEXT))
         } else if sql.contains(MASK_BLOCKING) {
-            mask(ColumnMask::new(0, UPPERCASE, TEXT).blocking())
+            mask(ColumnTransform::new(0, UPPERCASE, TEXT).blocking())
         } else if sql.contains(MASK_SECOND) {
-            mask(ColumnMask::new(0, UPPERCASE, TEXT).in_result(1))
+            mask(ColumnTransform::new(0, UPPERCASE, TEXT).in_result(1))
         } else if sql.contains(MASK_INT) {
-            mask(ColumnMask::new(0, INCREMENT, INTEGER))
-        } else if sql.contains(MASK) {
-            mask(ColumnMask::new(0, UPPERCASE, TEXT))
+            mask(ColumnTransform::new(0, INCREMENT, INTEGER))
+        } else if sql.contains(TRANSFORM) {
+            mask(ColumnTransform::new(0, UPPERCASE, TEXT))
         } else if sql.contains(BAD_PARAMS) {
             Verdict::rewrite(format!("{sql}, $9::int"))
         } else if sql.contains(REWRITE) {
@@ -117,13 +120,16 @@ impl Plugin for TestPlugin {
         VERSION.load(Ordering::Relaxed)
     }
 
-    fn mask_rows(batch: &MaskBatch<'_>, out: &mut MaskOutput) -> Result<(), MaskError> {
+    fn transform_rows(
+        batch: &TransformBatch<'_>,
+        out: &mut TransformOutput,
+    ) -> Result<(), TransformError> {
         MASK_BATCHES.fetch_add(1, Ordering::Relaxed);
         for column in batch.columns() {
-            if column.mask == FAIL {
-                return Err(MaskError::new("test mask failed"));
+            if column.transform == FAIL {
+                return Err(TransformError::new("test mask failed"));
             }
-            if column.mask == DIGEST {
+            if column.transform == DIGEST {
                 for value in column.values() {
                     out.push(value.map(|_| DIGEST_VALUE.as_slice()));
                 }
@@ -132,15 +138,15 @@ impl Plugin for TestPlugin {
             for value in column.values() {
                 let masked = match value {
                     None => None,
-                    Some(value) if column.mask == INCREMENT => {
+                    Some(value) if column.transform == INCREMENT => {
                         let datum = Datum::new(value, DataType::Integer, column.format, false)
-                            .map_err(|err| MaskError::new(err.to_string()))?;
+                            .map_err(|err| TransformError::new(err.to_string()))?;
                         let Datum::Integer(n) = datum else {
-                            return Err(MaskError::new("not an integer"));
+                            return Err(TransformError::new("not an integer"));
                         };
                         let encoded = Datum::Integer(n + 1)
                             .encode(column.format)
-                            .map_err(|err| MaskError::new(err.to_string()))?;
+                            .map_err(|err| TransformError::new(err.to_string()))?;
                         Some(encoded.to_vec())
                     }
                     Some(value) => Some(value.to_ascii_uppercase()),

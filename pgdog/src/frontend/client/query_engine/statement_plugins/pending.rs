@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tracing::debug;
 
-use super::masks::{Masking, Plan, PortalPlan};
+use super::transforms::{Masking, Plan, PortalPlan};
 
 /// A client message still waiting for its responses, with the mask plan of
 /// what it runs, if any.

@@ -2,12 +2,12 @@
 //! The plugin uses the same version of pgdog-plugin as PgDog and the same rustc version,
 //! so it should be loaded and executed.
 //!
-//! It also implements the statement, mask and error hooks, acting only on
+//! It also implements the statement, transform and error hooks, acting only on
 //! statements and errors containing one of its markers (see `hooks_spec.rb`).
 
 use pgdog_plugin::{
-    Capabilities, ColumnMask, Context, Deny, ErrorFields, MaskBatch, MaskError, MaskId,
-    MaskOutput, PdStr, Plugin, Redaction, Route, Session, Verdict, plugin,
+    Capabilities, ColumnTransform, Context, Deny, ErrorFields, TransformBatch, TransformError, TransformId,
+    TransformOutput, PdStr, Plugin, Redaction, Route, Session, Verdict, plugin,
 };
 use std::sync::OnceLock;
 
@@ -34,7 +34,7 @@ impl Plugin for TestPlugin {
     }
 
     fn capabilities() -> Capabilities {
-        Capabilities::ROUTE | Capabilities::STATEMENT | Capabilities::MASK | Capabilities::ERRORS
+        Capabilities::ROUTE | Capabilities::STATEMENT | Capabilities::TRANSFORM | Capabilities::ERRORS
     }
 
     fn statement(session: &Session<'_>, sql: &str) -> Verdict {
@@ -46,13 +46,13 @@ impl Plugin for TestPlugin {
         } else if sql.contains(REWRITE) {
             Verdict::rewrite(sql.replace(REWRITE, REWRITTEN))
         } else if sql.contains(UPPERCASE) {
-            Verdict::rewrite_masked(sql, vec![ColumnMask::new(0, MaskId(1), 25)])
+            Verdict::transform(sql, vec![ColumnTransform::new(0, TransformId(1), 25)])
         } else {
             Verdict::Allow
         }
     }
 
-    fn mask_rows(batch: &MaskBatch<'_>, out: &mut MaskOutput) -> Result<(), MaskError> {
+    fn transform_rows(batch: &TransformBatch<'_>, out: &mut TransformOutput) -> Result<(), TransformError> {
         for column in batch.columns() {
             for value in column.values() {
                 out.push(value.map(|value| value.to_ascii_uppercase()).as_deref());

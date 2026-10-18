@@ -10,7 +10,7 @@
 //! ```
 //! use pgdog_plugin::Capabilities;
 //!
-//! let caps = Capabilities::STATEMENT | Capabilities::MASK;
+//! let caps = Capabilities::STATEMENT | Capabilities::TRANSFORM;
 //! assert!(caps.contains(Capabilities::STATEMENT));
 //! assert!(!caps.contains(Capabilities::ROUTE));
 //! ```
@@ -30,11 +30,11 @@ impl Capabilities {
     /// called before PgDog parses a statement, and can rewrite or deny it.
     /// In this version, at most one loaded plugin can have this capability.
     pub const STATEMENT: Self = Self(1 << 1);
-    /// [`crate::Plugin::mask_rows`] is called for result columns the plugin's
-    /// statement verdicts asked to mask. In this version, it requires
+    /// [`crate::Plugin::transform_rows`] is called for result columns the plugin's
+    /// statement verdicts asked to transform. In this version, it requires
     /// [`Self::STATEMENT`], since only the statement plugin's verdicts name
-    /// columns to mask.
-    pub const MASK: Self = Self(1 << 2);
+    /// columns to transform.
+    pub const TRANSFORM: Self = Self(1 << 2);
     /// [`crate::Plugin::redact_error`] is called for every error and notice
     /// Postgres sends to a client.
     pub const ERRORS: Self = Self(1 << 3);
