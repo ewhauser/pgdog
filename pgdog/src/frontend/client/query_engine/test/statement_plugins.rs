@@ -503,6 +503,85 @@ async fn test_unprepared_statement_refused() {
     }
 }
 
+/// A denied Parse of the unnamed statement isn't replayed before a later
+/// Bind: PgDog saves the client's last unnamed Parse before plugins see it.
+#[tokio::test]
+async fn test_denied_unnamed_parse_not_replayed() {
+    let mut client = test_client().await;
+
+    // An unnamed statement the plugin allowed.
+    client.send(Parse::new_anonymous("SELECT 'allowed'")).await;
+    client.send(Bind::new_statement("")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(values(&messages), ["allowed"]);
+
+    // Replaced by one it denies.
+    client
+        .send(Parse::new_anonymous(&format!("SELECT '{BLOCK}'")))
+        .await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let error = client.read_until('Z').await.unwrap_err();
+    assert_eq!(error.code, "42501");
+    expect_message!(client.read().await, ReadyForQuery);
+
+    // Neither runs.
+    client.send(Bind::new_statement("")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let error = client.read_until('Z').await.unwrap_err();
+    assert_eq!(error.code, "26000", "{error:?}");
+    expect_message!(client.read().await, ReadyForQuery);
+}
+
+/// The unnamed statement bound again in a later request runs the statement
+/// the plugin decided on, with its masks, on whatever server connection the
+/// request gets: PgDog replays it every time, not only in the first request
+/// that executes it.
+#[tokio::test]
+async fn test_unnamed_statement_rebound_later() {
+    let mut client = test_client().await;
+    let mut other = test_client().await;
+
+    client
+        .send(Parse::new_anonymous(&format!(
+            "SELECT 'value' /* {TRANSFORM} */"
+        )))
+        .await;
+    client.send(Describe::new_statement("")).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    client.read_until('Z').await.unwrap();
+
+    client.send(Bind::new_statement("")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(values(&messages), ["VALUE"]);
+
+    // Another client holds the server connection the statement was
+    // prepared on, so the next request gets one without it.
+    other.send_simple(Query::new("BEGIN")).await;
+    other.read_until('Z').await.unwrap();
+    other.send_simple(Query::new("SELECT 'other'")).await;
+    other.read_until('Z').await.unwrap();
+
+    client.send(Bind::new_statement("")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(values(&messages), ["VALUE"]);
+
+    other.send_simple(Query::new("ROLLBACK")).await;
+    other.read_until('Z').await.unwrap();
+}
+
 /// PgDog answers the SET of a split query itself, without the server's
 /// CommandComplete; the SELECT is still the query's second result.
 #[tokio::test]

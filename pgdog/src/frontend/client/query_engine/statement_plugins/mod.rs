@@ -321,6 +321,18 @@ impl QueryEngine {
         context: &mut QueryEngineContext<'_>,
         client_request: &mut ClientRequest,
     ) -> Result<Option<ErrorResponse>, Error> {
+        let denied = self.decide_request(context, client_request)?;
+        if denied.is_some() {
+            self.forget_denied_unnamed(client_request);
+        }
+        Ok(denied)
+    }
+
+    fn decide_request(
+        &mut self,
+        context: &mut QueryEngineContext<'_>,
+        client_request: &mut ClientRequest,
+    ) -> Result<Option<ErrorResponse>, Error> {
         // Admin database commands are handled by PgDog and never reach Postgres.
         if context.admin {
             return Ok(None);
@@ -451,10 +463,13 @@ impl QueryEngine {
                             prepared.search_path = strings.search_path.to_string();
                         }
                         plan = prepared.decision.plan.clone();
-                    } else if context.prepared_statements.name(&name).is_none() {
+                    } else if name.is_empty() || context.prepared_statements.name(&name).is_none() {
                         // Neither the plugin nor PgDog saw it prepared by this
                         // client: a server connection may still hold someone
-                        // else's statement under that name.
+                        // else's statement under that name. The plugin's
+                        // record of the unnamed statement is the only one:
+                        // PgDog can still map it after a query or a denied
+                        // Parse replaced it.
                         return Ok(Some(not_prepared(&name)));
                     }
 
@@ -470,7 +485,7 @@ impl QueryEngine {
                     let name = describe.statement();
                     let pending = if describe.is_statement() {
                         if staged.prepared(&mut state.prepared, name).is_none()
-                            && context.prepared_statements.name(name).is_none()
+                            && (name.is_empty() || context.prepared_statements.name(name).is_none())
                         {
                             return Ok(Some(not_prepared(name)));
                         }
@@ -544,11 +559,37 @@ impl QueryEngine {
 
         // Drivers can execute the unnamed statement in a later request;
         // PgDog re-sends it from `last_parse`, which must be the rewritten one.
+        // `last_parse` is dropped after the first request that executes it,
+        // and a later request may get a server connection whose unnamed
+        // statement is another client's: replay the plugin's every time.
         if let Some(parse) = unnamed {
+            client_request.last_parse = Some(parse);
+        } else if client_request.needs_parse_injection()
+            && let Some(prepared) = self.statement_plugins.prepared.get("")
+        {
+            let mut parse = prepared.parse.clone();
+            if let Some(sql) = &prepared.decision.sql {
+                parse.set_query(sql);
+            }
             client_request.last_parse = Some(parse);
         }
 
         Ok(None)
+    }
+
+    /// The plugin denied a request. A denied Parse of the unnamed statement
+    /// replaces it, as in Postgres, so binding it later fails instead of
+    /// running the previous one or the denied one, which PgDog saved in
+    /// `last_parse` before the plugin saw it.
+    fn forget_denied_unnamed(&mut self, client_request: &mut ClientRequest) {
+        let unnamed = client_request
+            .messages
+            .iter()
+            .any(|message| matches!(message, ProtocolMessage::Parse(parse) if parse.anonymous()));
+        if unnamed {
+            self.statement_plugins.prepared.remove("");
+            client_request.last_parse = None;
+        }
     }
 
     /// The plugin denied the request. Report it like Postgres reports a failed
