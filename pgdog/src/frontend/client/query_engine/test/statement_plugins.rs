@@ -1,6 +1,8 @@
 //! Statement plugin hook.
 use std::sync::atomic::Ordering;
 
+use pgdog_config::PreparedStatementsLevel;
+
 use crate::{
     expect_message,
     net::{
@@ -10,7 +12,7 @@ use crate::{
     plugin::test::*,
 };
 
-use super::prelude::*;
+use super::{change_config, prelude::*};
 
 async fn test_client() -> TestClient {
     load_test_plugin();
@@ -947,4 +949,86 @@ async fn test_statement_errors_redacted() {
         .await;
     let error = client.read_until('Z').await.unwrap_err();
     assert!(error.message.contains("plain-value"), "{error:?}");
+}
+
+/// With `extended_anonymous`, PgDog's mapping of the unnamed statement
+/// outlives a denied Parse that replaces it. Binding it must fail rather than
+/// run the replaced statement without the plugin's plan, and so its masks.
+#[tokio::test]
+async fn test_denied_unnamed_parse_extended_anonymous() {
+    let mut client = test_client().await;
+    change_config(|general| {
+        general.prepared_statements = PreparedStatementsLevel::ExtendedAnonymous;
+    });
+
+    // A masked unnamed statement.
+    client
+        .send(Parse::new_anonymous(&format!(
+            "SELECT 'secret' AS v, '{TRANSFORM}' AS marker"
+        )))
+        .await;
+    client.send(Bind::new_statement("")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(values(&messages), ["SECRET"]);
+
+    // Replaced by one the plugin denies.
+    client
+        .send(Parse::new_anonymous(&format!("SELECT '{BLOCK}'")))
+        .await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let error = client.read_until('Z').await.unwrap_err();
+    assert_eq!(error.code, "42501");
+    expect_message!(client.read().await, ReadyForQuery);
+
+    // Neither runs.
+    client.send(Bind::new_statement("")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let error = client.read_until('Z').await.unwrap_err();
+    assert_eq!(error.code, "26000", "{error:?}");
+    expect_message!(client.read().await, ReadyForQuery);
+}
+
+/// A Parse of the unnamed statement discarded while skipping to Sync after a
+/// denied message never reached the plugin, so it never runs. As in Postgres,
+/// the unnamed statement it would have replaced is still there.
+#[tokio::test]
+async fn test_skipped_unnamed_parse_not_replayed() {
+    let mut client = test_client().await;
+
+    // An unnamed statement the plugin allowed.
+    client.send(Parse::new_anonymous("SELECT 'allowed'")).await;
+    client.send(Bind::new_statement("")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(values(&messages), ["allowed"]);
+
+    // A denied message, then an unnamed Parse discarded until Sync.
+    client
+        .send(Parse::named("blocked", format!("SELECT '{BLOCK}'")))
+        .await;
+    client.send(Flush).await;
+    client.try_process().await.unwrap();
+    let error = expect_message!(client.read().await, ErrorResponse);
+    assert_eq!(error.code, "42501");
+
+    client.send(Parse::new_anonymous("SELECT 'skipped'")).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    expect_message!(client.read().await, ReadyForQuery);
+
+    // The allowed statement runs, not the skipped one.
+    client.send(Bind::new_statement("")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let messages = client.read_until('Z').await.unwrap();
+    assert_eq!(values(&messages), ["allowed"]);
 }
